@@ -15,7 +15,7 @@ import socket
 print = functools.partial(print, flush=True)  # keep server log visible even when output is redirected
 
 from common import (
-    CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
+    CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, recv_line, send_line,
 )
@@ -68,10 +68,10 @@ class Session:
 
 def handle_stor(session, filename):
     if not filename:
-        send_line(session.conn, "501 Syntax error in parameters.")
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
         return
     path = safe_path(filename)
-    send_line(session.conn, "150 File status okay, opening data connection.")
+    send_line(session.conn, Reply.FILE_STATUS_OK)
     chunks = {}
     session.udp_sock.settimeout(SOCK_TIMEOUT)
     try:
@@ -86,29 +86,29 @@ def handle_stor(session, filename):
             if pkt_type == PKT_DATA:
                 chunks[seq] = payload
     except socket.timeout:
-        send_line(session.conn, "426 Connection closed; transfer aborted.")
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
         return
     with open(path, "wb") as f:
         for seq in sorted(chunks):
             f.write(chunks[seq])
     size = sum(len(c) for c in chunks.values())
     print(f"[+] Stored '{filename}' ({size} bytes) from user '{session.username}'")
-    send_line(session.conn, "226 Transfer complete.")
+    send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
 
 def handle_retr(session, filename):
     if not filename:
-        send_line(session.conn, "501 Syntax error in parameters.")
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
         return
     path = safe_path(filename)
     if not os.path.isfile(path):
-        send_line(session.conn, "550 File unavailable.")
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
         return
     endpoint = session.resolve_data_endpoint()
     if endpoint is None:
-        send_line(session.conn, "425 Can't open data connection.")
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
         return
-    send_line(session.conn, "150 File status okay, opening data connection.")
+    send_line(session.conn, Reply.FILE_STATUS_OK)
     with open(path, "rb") as f:
         data = f.read()
     seq = 0
@@ -118,102 +118,139 @@ def handle_retr(session, filename):
         seq += 1
     session.udp_sock.sendto(make_packet(PKT_FIN, seq), endpoint)
     print(f"[+] Sent '{filename}' ({len(data)} bytes) to user '{session.username}'")
-    send_line(session.conn, "226 Transfer complete.")
+    send_line(session.conn, Reply.TRANSFER_COMPLETE)
+
+
+def cleanup_session(session):
+    """Always run when a session ends — clean QUIT, abrupt disconnect, or an
+    unhandled error — so the socket is closed and state doesn't linger.
+
+    Guaranteed via try/finally in handle_client(), so a client that
+    disconnects without sending QUIT (crash, Ctrl+C, lost network) is torn
+    down exactly the same way as one that logs out properly.
+    """
+    try:
+        session.conn.close()
+    except OSError:
+        pass
+    print(f"[*] Session for {session.addr} (user={session.username!r}) closed.")
 
 
 def handle_client(conn, addr, udp_sock):
     session = Session(conn, addr, udp_sock)
     print(f"[+] Connection from {addr}")
-    send_line(conn, "220 Service ready.")
+    # Idle timeout on the control channel: if a client dies without ever
+    # sending FIN/RST (power loss, network drop, VM freeze — not just a
+    # killed process, which the OS still closes cleanly), recv() would
+    # otherwise block here forever and freeze this single-threaded server
+    # for every other client. Each successful recv() implicitly renews the
+    # timer for the next one; NOOP exists specifically to trigger that renewal.
+    conn.settimeout(CONTROL_IDLE_TIMEOUT)
     try:
+        send_line(conn, Reply.SERVICE_READY)
         while True:
-            line = recv_line(conn)
-            if line is None:
-                print(f"[-] {addr} disconnected.")
-                break
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(maxsplit=1)
-            cmd = parts[0].upper()
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            print(f"[{addr}] {line}")
-
-            if cmd == "USER":
-                if not arg:
-                    send_line(conn, "501 Syntax error in parameters.")
+            # Every read AND every reply for this command lives inside one
+            # try/except: if the client vanishes mid-command (process
+            # killed, network drop) instead of sending QUIT, recv/send will
+            # raise a connection-level error here. We treat that exactly
+            # like a normal disconnect — log it and fall through to
+            # cleanup_session() in the outer finally — rather than letting
+            # it propagate as an unhandled crash.
+            try:
+                line = recv_line(conn)
+                if line is None:
+                    print(f"[-] {addr} disconnected.")
+                    break
+                line = line.strip()
+                if not line:
                     continue
-                session.username = arg
-                session.authenticated = False
-                send_line(conn, "331 Username OK, need password.")
+                parts = line.split(maxsplit=1)
+                cmd = parts[0].upper()
+                arg = parts[1].strip() if len(parts) > 1 else ""
+                print(f"[{addr}] {line}")
 
-            elif cmd == "PASS":
-                if session.username and USERS.get(session.username) == arg:
-                    session.authenticated = True
-                    send_line(conn, "230 Login successful.")
-                    # Fixed data-channel handshake: wait for the client's
-                    # HELLO datagram so we learn its UDP address.
-                    udp_sock.settimeout(SOCK_TIMEOUT)
-                    try:
-                        raw, caddr = udp_sock.recvfrom(1024)
-                        pkt_type, _, _, _ = parse_packet(raw)
-                        if pkt_type == PKT_HELLO:
-                            session.client_data_addr = caddr
-                    except socket.timeout:
-                        pass
+                if cmd == "USER":
+                    if not arg:
+                        send_line(conn, Reply.SYNTAX_ERROR_PARAMS)
+                        continue
+                    session.username = arg
+                    session.authenticated = False
+                    send_line(conn, Reply.USER_OK_NEED_PASS)
+
+                elif cmd == "PASS":
+                    if session.username and USERS.get(session.username) == arg:
+                        session.authenticated = True
+                        send_line(conn, Reply.LOGIN_SUCCESS)
+                        # Fixed data-channel handshake: wait for the client's
+                        # HELLO datagram so we learn its UDP address.
+                        udp_sock.settimeout(SOCK_TIMEOUT)
+                        try:
+                            raw, caddr = udp_sock.recvfrom(1024)
+                            pkt_type, _, _, valid = parse_packet(raw)
+                            if valid and pkt_type == PKT_HELLO:
+                                session.client_data_addr = caddr
+                        except socket.timeout:
+                            pass
+                    else:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+
+                elif cmd == "NOOP":
+                    send_line(conn, Reply.COMMAND_OK)
+
+                elif cmd == "PWD":
+                    send_line(conn, Reply.pwd(STORAGE_ROOT))
+
+                elif cmd == "TYPE":
+                    mode = arg.upper()
+                    if mode == "A":
+                        session.type_mode = "A"
+                        send_line(conn, Reply.COMMAND_OK)
+                    else:
+                        send_line(conn, Reply.TYPE_NOT_IMPLEMENTED)
+
+                elif cmd == "SIZE":
+                    path = safe_path(arg)
+                    if arg and os.path.isfile(path):
+                        send_line(conn, Reply.size(os.path.getsize(path)))
+                    else:
+                        send_line(conn, Reply.FILE_UNAVAILABLE)
+
+                elif cmd == "HELP":
+                    send_line(conn, Reply.HELP_TEXT)
+
+                elif cmd in ("PORT", "PASV"):
+                    send_line(conn, Reply.MODE_NOT_IMPLEMENTED)
+
+                elif cmd == "STOR":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_stor(session, arg)
+
+                elif cmd == "RETR":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_retr(session, arg)
+
+                elif cmd == "QUIT":
+                    send_line(conn, Reply.GOODBYE)
+                    break
+
+                elif cmd in NOT_IMPLEMENTED:
+                    send_line(conn, Reply.NOT_IMPLEMENTED)
+
                 else:
-                    send_line(conn, "530 Not logged in.")
+                    send_line(conn, Reply.SYNTAX_ERROR_CMD)
 
-            elif cmd == "NOOP":
-                send_line(conn, "200 Command OK.")
-
-            elif cmd == "PWD":
-                send_line(conn, f'257 "{STORAGE_ROOT}"')
-
-            elif cmd == "TYPE":
-                mode = arg.upper()
-                if mode == "A":
-                    session.type_mode = "A"
-                    send_line(conn, "200 Command OK.")
-                else:
-                    send_line(conn, "502 Command not implemented (Basic Level supports TYPE A only).")
-
-            elif cmd == "SIZE":
-                path = safe_path(arg)
-                if arg and os.path.isfile(path):
-                    send_line(conn, f"213 {os.path.getsize(path)}")
-                else:
-                    send_line(conn, "550 File unavailable.")
-
-            elif cmd == "HELP":
-                send_line(conn, "214 Commands: USER PASS QUIT NOOP PWD TYPE SIZE STOR RETR HELP")
-
-            elif cmd in ("PORT", "PASV"):
-                send_line(conn, "502 Command not implemented (reserved for Advanced Level active/passive mode).")
-
-            elif cmd == "STOR":
-                if not session.authenticated:
-                    send_line(conn, "530 Not logged in.")
-                else:
-                    handle_stor(session, arg)
-
-            elif cmd == "RETR":
-                if not session.authenticated:
-                    send_line(conn, "530 Not logged in.")
-                else:
-                    handle_retr(session, arg)
-
-            elif cmd == "QUIT":
-                send_line(conn, "221 Goodbye.")
+            except socket.timeout:
+                print(f"[-] {addr} idle for {CONTROL_IDLE_TIMEOUT:.0f}s with no NOOP/command, closing session.")
                 break
-
-            elif cmd in NOT_IMPLEMENTED:
-                send_line(conn, "502 Command not implemented.")
-
-            else:
-                send_line(conn, "500 Syntax error, command unrecognized.")
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                print(f"[-] {addr} disconnected abruptly: {e!r}")
+                break
     finally:
-        conn.close()
+        cleanup_session(session)
 
 
 def main():
@@ -233,7 +270,12 @@ def main():
     try:
         while True:
             conn, addr = tcp_sock.accept()
-            handle_client(conn, addr, udp_sock)   # single-threaded: one client at a time
+            try:
+                handle_client(conn, addr, udp_sock)   # single-threaded: one client at a time
+            except Exception as e:
+                # A single bad session (malformed input, unexpected client
+                # behavior, etc.) must not take the whole server down.
+                print(f"[!] Session with {addr} crashed: {e!r}")
     except KeyboardInterrupt:
         print("\n[*] Server shutting down.")
     finally:
