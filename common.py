@@ -1,5 +1,6 @@
 """Shared constants and helpers for the Hybrid FTP control (TCP) and data (UDP) channels."""
 
+import re
 import struct
 import zlib
 
@@ -51,6 +52,36 @@ def parse_packet(raw):
     return pkt_type, seq, payload, valid
 
 
+# --- PORT/PASV address encoding (Advanced Level: Active/Passive mode) --------
+# Same "h1,h2,h3,h4,p1,p2" encoding RFC 959 uses for the PORT command and the
+# PASV reply's parenthesized address, shared here since both client and
+# server need to format/parse it identically.
+def format_port_arg(ip, port):
+    h1, h2, h3, h4 = ip.split(".")
+    p1, p2 = divmod(port, 256)
+    return f"{h1},{h2},{h3},{h4},{p1},{p2}"
+
+
+def parse_port_arg(arg):
+    """Returns (ip, port), or None if arg isn't a valid h1,h2,h3,h4,p1,p2 tuple."""
+    try:
+        parts = [int(x) for x in arg.strip().split(",")]
+        if len(parts) != 6 or any(not (0 <= x <= 255) for x in parts):
+            return None
+        h1, h2, h3, h4, p1, p2 = parts
+        return f"{h1}.{h2}.{h3}.{h4}", p1 * 256 + p2
+    except ValueError:
+        return None
+
+
+def parse_pasv_reply(text):
+    """Extracts (ip, port) from a '227 ... (h1,h2,h3,h4,p1,p2).' reply line."""
+    m = re.search(r"\(([\d,]+)\)", text)
+    if not m:
+        return None
+    return parse_port_arg(m.group(1))
+
+
 # --- TCP control-channel line protocol ---------------------------------------
 def recv_line(conn):
     """Read a single CRLF/LF-terminated line from a TCP socket. None on EOF."""
@@ -79,7 +110,8 @@ class Reply:
     LOGIN_SUCCESS = "230 Login successful."
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
-    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP PWD TYPE SIZE STOR RETR HELP"
+    HELP_TEXT = ("214 Commands: USER PASS QUIT NOOP PWD CWD CDUP MKD RMD LIST NLST STAT "
+                 "SIZE MDTM TYPE MODE PORT PASV STOR RETR HELP")
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
@@ -88,8 +120,8 @@ class Reply:
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."
     SYNTAX_ERROR_PARAMS = "501 Syntax error in parameters."
     NOT_IMPLEMENTED = "502 Command not implemented."
-    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (Basic Level supports TYPE A only)."
-    MODE_NOT_IMPLEMENTED = "502 Command not implemented (reserved for Advanced Level active/passive mode)."
+    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (supported: TYPE A, TYPE I)."
+    MODE_NOT_IMPLEMENTED = "502 Command not implemented (Advanced Level supports MODE S only)."
     GOODBYE = "221 Goodbye."
 
     @staticmethod
@@ -99,3 +131,30 @@ class Reply:
     @staticmethod
     def size(nbytes):
         return f"213 {nbytes}"
+
+    @staticmethod
+    def cwd_ok(path):
+        return f'250 Directory changed to "{path}".'
+
+    @staticmethod
+    def dir_created(path):
+        return f'257 "{path}" created.'
+
+    @staticmethod
+    def pasv(ip, port):
+        return f"227 Entering Passive Mode ({format_port_arg(ip, port)})."
+
+    @staticmethod
+    def port_ok(server_port):
+        # The extra "data port N" text is a deliberate, disclosed deviation
+        # from RFC 959: real active-mode FTP doesn't need to report the
+        # server's port back because TCP's server-initiated connect() reuses
+        # one bidirectional socket. Our UDP data channel is connectionless,
+        # so the client's upload direction (STOR) needs to be told where the
+        # server's per-session socket lives; only the reply text carries that.
+        return f"200 PORT command successful; server data port {server_port}."
+
+    @staticmethod
+    def status(session):
+        return (f"211 user={session.username!r} cwd={session.cwd} "
+                f"mode={session.data_mode} type={session.type_mode}")

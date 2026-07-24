@@ -265,3 +265,109 @@ def parse_packet(raw):
    the local filesystem, not the VM.
 
 ---
+
+## Entry 10 — Advanced Level implementation
+
+**Prompt used:**
+> I want my project can display all of the levels like in the future if there is some alternative
+> technique use we should create option for user to choose or they can config and don't completly
+> change the feature. Now code for me advanced feature. We've coded the basic so far.
+
+**Raw GenAI output (summary of actions taken):**
+Before writing any code, the AI flagged that `README.md`'s "Deliberately not implemented" section had
+merged the real Advanced and Excellent rubric tiers into one undifferentiated list, and asked two
+clarifying questions: (1) which specific items actually count as "Advanced Level," and (2) how the
+user/config choice should be exposed (CLI flags, a config file, or protocol commands only). The student
+answered by pointing to the actual assignment PDF (`Project1_SocketProgramming_2026.pdf`, one directory
+above the repo, not previously read by the AI) and chose "config file."
+
+The AI read the PDF directly and extracted the real Section 1.3 rubric: Advanced Level = (a) binary file
+handling (`TYPE I`), (b) directory tree navigation (`CWD`/`CDUP`/`MKD`/`RMD`/`LIST`/`NLST`/`STAT`), (c)
+Active/Passive mode switching (`PORT`/`PASV`), (d) a multi-threaded/multi-process concurrent server. It
+then implemented all four, gated behind a new `config.py`/`config.ini` layer whose defaults reproduce
+Basic Level exactly (deleting `config.ini`, or any key in it, changes nothing). Specific changes:
+- `common.py`: added `format_port_arg`/`parse_port_arg`/`parse_pasv_reply` (RFC 959 address encoding)
+  and new `Reply` entries (`pasv`, `port_ok`, `cwd_ok`, `dir_created`, `status`); updated `TYPE`/`MODE`
+  reply text since the old wording (e.g. "reserved for Advanced Level active/passive mode") was now
+  stale.
+- `server.py`: `Session` gained `cwd`, `data_sock`/`owns_data_sock` (per-session UDP socket for
+  ACTIVE/PASSIVE vs. the old shared fixed-port socket), and `resolve_data_endpoint()` was changed to
+  return `(socket, address)` instead of just an address. Added `handle_pasv`/`handle_port` (each opens
+  a dedicated ephemeral UDP socket), `resolve_path`/`safe_path` (confines all file/dir arguments under
+  `STORAGE_ROOT`, rejecting `..` escapes), `handle_cwd`/`handle_mkd`/`handle_rmd`/`handle_list`/
+  `handle_stat`/`handle_mdtm`, and a `threading.Thread`-per-connection accept loop gated by
+  `config.ini`'s `[server] threading` key, plus a lock-protected `_active_sessions` table printed to
+  the server log on every connect/disconnect/mode-change.
+- `client.py`: added `set_active()`/`set_passive()`/`set_fixed()` and matching REPL commands
+  (`active`/`passive`/`fixed`/`cwd`/`cdup`/`mkd`/`rmd`/`ls`/`nlst`/`stat`/`mdtm`/`type`), plus a shared
+  `_recv_data_payload()` helper reused by both `get()` and the new `list_dir()`.
+
+The AI then ran its own verification (all on `localhost`, single machine):
+1. **Basic Level regression** — default `config.ini` (`threading=single`, `data_mode=fixed`), a
+   `put`/`get` round-trip, `diff`'d byte-for-byte against the source file.
+2. **Directory tree** — `mkd sub` → `cwd sub` → `put` a file into it → `ls`/`nlst`/`stat`/`mdtm`, then
+   `cdup` and `ls` again to confirm the file only appears inside `sub/`.
+3. **Binary transfer in both Advanced modes** — a 5000-byte random binary file, `put`+`get` round-tripped
+   once over PASSIVE mode and once over ACTIVE mode, both `diff`'d byte-for-byte.
+4. **Concurrency** — `threading=thread`, two separate client processes (`alice`, `bob`) each doing a
+   20KB-random-file `put`+`get` round trip in PASSIVE mode *simultaneously* (backgrounded shell jobs),
+   both `diff`'d byte-for-byte afterward; the server log's session table was inspected and showed both
+   `#4` and `#5` listed concurrently with `mode=PASSIVE` before either disconnected.
+
+It then updated `README.md` and `CLAUDE.md` to document the config keys, the three data-channel modes,
+and one explicitly disclosed deviation from RFC 959: in real active-mode FTP the server doesn't need to
+report its own port back to the client, because TCP's server-initiated `connect()` reuses one
+bidirectional socket; this project's UDP data channel is connectionless, so the upload direction (STOR
+in ACTIVE mode) needs an explicit destination port, which is why `Reply.port_ok()` appends
+`"; server data port N"` to the `200` reply instead of a bare `200 Command OK.`.
+
+**Refinement & problem solving:**
+- The AI asking which rubric items count as "Advanced Level" *before* writing code — rather than
+  guessing from the group's own earlier (and, it turned out, imprecise) README — avoided building
+  against a stale self-authored summary instead of the actual PDF. Pointing the AI at the real spec
+  file was the single most consequential correction in this entry: it changed the AI's assumed rubric
+  from an unstructured Basic+Advanced+Excellent grab-bag into the four precise Advanced Level bullets
+  the assignment actually grades.
+- **[Student to fill in]**: explain in your own words *why* FIXED-mode sessions are not safely isolated
+  under concurrency (they share one server-wide UDP socket, demuxed only by best-effort source-address
+  filtering in `handle_stor`) while ACTIVE/PASSIVE sessions are (each gets its own per-session ephemeral
+  socket via `handle_port`/`handle_pasv`) — this is exactly the "Active/Passive mode nuance" the rubric's
+  Theoretical Understanding "Good/Very Good" tier asks for, and it's a genuine, disclosed limitation of
+  this codebase, not a hypothetical.
+- The AI's own tests only prove the protocol logic is self-consistent on one machine (same caveat as
+  Entry 1) — they are not a substitute for a live two-machine demo exercising PASV/PORT and concurrent
+  sessions, which Section 4.5 of the spec requires before the oral defense, including showing the active
+  session table live in the server log.
+- **[Student to fill in]**: any additional manual verification, pushback, or questions raised about the
+  AI's design choices beyond what's captured above — in particular, whether the `Reply.port_ok()`
+  deviation from RFC 959 was independently understood/re-derived, since Section 4.2's zero-tolerance
+  policy means being unable to explain *why* that deviation exists on the spot is an automatic 0 for
+  both Theoretical Understanding and Live Coding.
+
+---
+
+## Entry 11
+
+**Prompt used:**
+> những hàm trong common này hỗ trợ gì
+> [pasted `format_port_arg`, `parse_port_arg`, `parse_pasv_reply` from `common.py`, added in Entry 10]
+
+**Raw GenAI output:**
+The AI explained, in Vietnamese matching the question's language, that these three functions implement
+RFC 959's `h1,h2,h3,h4,p1,p2` address encoding shared by the `PORT` command and the `PASV` reply (a port
+number doesn't fit in one 0–255 field, so it's split into two bytes `p1`/`p2` where
+`port = p1*256 + p2`): `format_port_arg(ip, port)` encodes an `(ip, port)` tuple into that
+comma-separated string, used client-side (`client.py`'s `set_active()`) when sending `PORT`;
+`parse_port_arg(arg)` decodes it back into `(ip, port)`, used server-side (`server.py`'s `handle_port()`)
+when receiving `PORT`, returning `None` on malformed input instead of raising; `parse_pasv_reply(text)`
+regex-extracts the parenthesized substring from a full `227 Entering Passive Mode (...).` reply line and
+hands it to `parse_port_arg`, used client-side (`set_passive()`) when receiving a `PASV` reply.
+
+**Refinement & problem solving:**
+- **[Student to fill in]**: confirm you can reproduce this explanation unaided and hand-trace one
+  example end to end (e.g. port `54321` → `divmod(54321, 256)` = `(212, 49)` →
+  `"h1,h2,h3,h4,212,49"` → decoded back as `212*256 + 49 = 54321`) — per Section 4.2, being unable to
+  walk through this on the spot during the oral viva is an automatic 0 for Theoretical Understanding and
+  Live Coding, regardless of whether the code itself works.
+
+---

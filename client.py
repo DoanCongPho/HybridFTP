@@ -1,13 +1,25 @@
-"""Hybrid FTP client — Basic Level. Interactive CLI.
+"""Hybrid FTP client — Basic + Advanced Level. Interactive CLI.
 
 Usage:
     python3 client.py <server_host>
 
 Commands:
-    user <name>              PASS <name>
+    user <name>                        PASS <name>
     pass <password>
     put <local_file> [remote_name]     upload (STOR)
     get <remote_name> [local_file]     download (RETR)
+    cwd <path>                         change server directory
+    cdup                               go to parent directory
+    mkd <dirname>                      create a directory
+    rmd <dirname>                      remove an (empty) directory
+    ls / list [path]                   detailed directory listing
+    nlst [path]                        name-only directory listing
+    stat [path]                        server/session or path status
+    mdtm <filename>                    last-modified timestamp
+    type {A|I}                         ASCII or binary transfer type
+    active                             switch to Active mode (PORT)
+    passive                            switch to Passive mode (PASV)
+    fixed                              switch back to Basic Level fixed mode
     pwd
     size <filename>
     noop
@@ -16,24 +28,37 @@ Commands:
 """
 
 import os
+import re
 import sys
 import socket
 
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
     PKT_HELLO, PKT_DATA, PKT_FIN,
-    make_packet, parse_packet, recv_line, send_line,
+    make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
 )
+from config import CONFIG
 
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_downloads")
+DOWNLOAD_DIR_CFG = CONFIG.get("client", "download_dir", fallback="client_downloads")
+DOWNLOAD_DIR = (DOWNLOAD_DIR_CFG if os.path.isabs(DOWNLOAD_DIR_CFG)
+                 else os.path.join(os.path.dirname(os.path.abspath(__file__)), DOWNLOAD_DIR_CFG))
+
+_DEFAULT_DATA_MODE = CONFIG.get("client", "data_mode", fallback="fixed").strip().lower()
+_MODE_MAP = {"fixed": DataMode.FIXED, "active": DataMode.ACTIVE, "passive": DataMode.PASSIVE}
 
 
 class FTPClient:
     def __init__(self, host, control_port=CONTROL_PORT, data_port=DATA_PORT):
         self.host = host
         self.data_port = data_port
-        self.data_mode = DataMode.FIXED   # only mode implemented at Basic Level
         self.authenticated = False
+
+        # Data-channel mode. FIXED reproduces Basic Level exactly (HELLO to
+        # the server's well-known DATA_PORT). ACTIVE/PASSIVE are negotiated
+        # live via PORT/PASV — see set_active()/set_passive()/set_fixed().
+        self.data_mode = _MODE_MAP.get(_DEFAULT_DATA_MODE, DataMode.FIXED)
+        self.active_server_port = None   # learned from the server's PORT reply
+        self.passive_target = None       # learned from the server's PASV reply
 
         self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.conn.connect((host, control_port))
@@ -53,8 +78,62 @@ class FTPClient:
         send_line(self.conn, text)
         return self._read_reply()
 
+    def _data_target(self):
+        if self.data_mode == DataMode.FIXED:
+            return (self.host, self.data_port)
+        if self.data_mode == DataMode.ACTIVE:
+            return (self.host, self.active_server_port)
+        if self.data_mode == DataMode.PASSIVE:
+            return self.passive_target
+        raise NotImplementedError(f"data mode {self.data_mode!r} not implemented")
+
+    def set_fixed(self):
+        """Switch back to Basic Level's fixed data-channel mechanism."""
+        self.data_mode = DataMode.FIXED
+        self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), (self.host, self.data_port))
+        print(f"[*] Data mode: FIXED ({self.host}:{self.data_port})")
+
+    def set_active(self):
+        """Advanced Level: tell the server our address via PORT; it opens a
+        dedicated per-session socket and reports its port back (needed for
+        the upload direction, since UDP has no server-initiated connect())."""
+        local_ip = self.conn.getsockname()[0]
+        local_port = self.udp_sock.getsockname()[1]
+        reply = self.command(f"PORT {format_port_arg(local_ip, local_port)}")
+        print(reply)
+        if not reply.startswith("200"):
+            return False
+        m = re.search(r"data port (\d+)", reply)
+        if not m:
+            print("[!] Server did not report a data port; staying on the previous mode.")
+            return False
+        self.active_server_port = int(m.group(1))
+        self.data_mode = DataMode.ACTIVE
+        print(f"[*] Data mode: ACTIVE (server will use port {self.active_server_port})")
+        return True
+
+    def set_passive(self):
+        """Advanced Level: ask the server to open a per-session socket via
+        PASV, then HELLO it so it learns our address (same mechanism FIXED
+        mode uses, just on a private port)."""
+        reply = self.command("PASV")
+        print(reply)
+        if not reply.startswith("227"):
+            return False
+        parsed = parse_pasv_reply(reply)
+        if parsed is None:
+            print("[!] Could not parse PASV reply.")
+            return False
+        self.passive_target = parsed
+        self.data_mode = DataMode.PASSIVE
+        self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), self.passive_target)
+        print(f"[*] Data mode: PASSIVE (server at {self.passive_target[0]}:{self.passive_target[1]})")
+        return True
+
     def login(self, username, password):
-        """Send PASS and, on success, register our UDP address with a HELLO packet.
+        """Send PASS and, on success, establish the data channel using
+        whichever mode is currently selected (config default, or a prior
+        `active`/`passive` REPL command).
 
         Assumes USER has already been sent for `username` (the REPL sends it
         as soon as the user types `user <name>`, before `pass` is typed).
@@ -63,40 +142,20 @@ class FTPClient:
         print(reply)
         if reply.startswith("230"):
             self.authenticated = True
-            if self.data_mode == DataMode.FIXED:
-                # Register our UDP address with the server for this session.
+            if self.data_mode == DataMode.ACTIVE:
+                self.set_active()
+            elif self.data_mode == DataMode.PASSIVE:
+                self.set_passive()
+            else:
                 self.udp_sock.sendto(make_packet(PKT_HELLO, 0, username.encode("ascii")),
                                       (self.host, self.data_port))
-            else:
-                raise NotImplementedError(f"data mode {self.data_mode!r} not implemented at Basic Level")
         return self.authenticated
 
-    def put(self, local_path, remote_name=None):
-        if not os.path.isfile(local_path):
-            print(f"[!] Local file not found: {local_path}")
-            return
-        remote_name = remote_name or os.path.basename(local_path)
-        reply = self.command(f"STOR {remote_name}")
-        print(reply)
-        if not reply.startswith("150"):
-            return
-        with open(local_path, "rb") as f:
-            data = f.read()
-        seq = 0
-        for i in range(0, len(data), CHUNK_SIZE):
-            chunk = data[i:i + CHUNK_SIZE]
-            self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), (self.host, self.data_port))
-            seq += 1
-        self.udp_sock.sendto(make_packet(PKT_FIN, seq), (self.host, self.data_port))
-        print(self._read_reply())
-
-    def get(self, remote_name, local_path=None):
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        local_path = local_path or os.path.join(DOWNLOAD_DIR, remote_name)
-        reply = self.command(f"RETR {remote_name}")
-        print(reply)
-        if not reply.startswith("150"):
-            return
+    def _recv_data_payload(self):
+        """Receive one data-channel transfer (PKT_DATA... PKT_FIN) and
+        reassemble it in sequence order. Used by both get() (saved to a
+        file) and list_dir() (printed to stdout) — RETR/LIST/NLST all use
+        the same UDP framing on the server side."""
         chunks = {}
         self.udp_sock.settimeout(SOCK_TIMEOUT)
         try:
@@ -112,11 +171,55 @@ class FTPClient:
                     chunks[seq] = payload
         except socket.timeout:
             print("[!] Data transfer timed out.")
+            return None
+        return b"".join(chunks[s] for s in sorted(chunks))
+
+    def put(self, local_path, remote_name=None):
+        if not os.path.isfile(local_path):
+            print(f"[!] Local file not found: {local_path}")
+            return
+        remote_name = remote_name or os.path.basename(local_path)
+        reply = self.command(f"STOR {remote_name}")
+        print(reply)
+        if not reply.startswith("150"):
+            return
+        with open(local_path, "rb") as f:
+            data = f.read()
+        target = self._data_target()
+        seq = 0
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunk = data[i:i + CHUNK_SIZE]
+            self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
+            seq += 1
+        self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
+        print(self._read_reply())
+
+    def get(self, remote_name, local_path=None):
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        local_path = local_path or os.path.join(DOWNLOAD_DIR, remote_name)
+        reply = self.command(f"RETR {remote_name}")
+        print(reply)
+        if not reply.startswith("150"):
+            return
+        data = self._recv_data_payload()
+        if data is None:
             return
         with open(local_path, "wb") as f:
-            for seq in sorted(chunks):
-                f.write(chunks[seq])
-        print(f"[+] Saved to {local_path} ({sum(len(c) for c in chunks.values())} bytes)")
+            f.write(data)
+        print(f"[+] Saved to {local_path} ({len(data)} bytes)")
+        print(self._read_reply())
+
+    def list_dir(self, path="", name_only=False):
+        cmd = "NLST" if name_only else "LIST"
+        reply = self.command(f"{cmd} {path}".strip())
+        print(reply)
+        if not reply.startswith("150"):
+            return
+        data = self._recv_data_payload()
+        if data is None:
+            return
+        text = data.decode("utf-8", errors="replace")
+        print(text if text else "(empty)")
         print(self._read_reply())
 
     def close(self):
@@ -162,6 +265,30 @@ def repl(host):
                     print("Usage: get <remote_name> [local_file]")
                     continue
                 client.get(bits[0], bits[1] if len(bits) > 1 else None)
+            elif cmd in ("ls", "list"):
+                client.list_dir(arg, name_only=False)
+            elif cmd == "nlst":
+                client.list_dir(arg, name_only=True)
+            elif cmd == "cwd":
+                print(client.command(f"CWD {arg}"))
+            elif cmd == "cdup":
+                print(client.command("CDUP"))
+            elif cmd == "mkd":
+                print(client.command(f"MKD {arg}"))
+            elif cmd == "rmd":
+                print(client.command(f"RMD {arg}"))
+            elif cmd == "stat":
+                print(client.command(f"STAT {arg}".strip()))
+            elif cmd == "mdtm":
+                print(client.command(f"MDTM {arg}"))
+            elif cmd == "type":
+                print(client.command(f"TYPE {arg or 'A'}"))
+            elif cmd == "active":
+                client.set_active()
+            elif cmd == "passive":
+                client.set_passive()
+            elif cmd == "fixed":
+                client.set_fixed()
             elif cmd == "pwd":
                 print(client.command("PWD"))
             elif cmd == "size":
