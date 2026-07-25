@@ -28,6 +28,7 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_port_arg, recv_line, send_line,
+    gbn_send, gbn_receive, compute_hash,
 )
 from config import CONFIG
 
@@ -52,16 +53,29 @@ PASSIVE_PORT_RANGE = (
     (int(_pasv_min_raw), int(_pasv_max_raw)) if _pasv_min_raw and _pasv_max_raw else None
 )
 
+# Excellent Level: Go-Back-N reliable-UDP layer. "none" (default) preserves
+# the exact best-effort framing above; both server and client must agree on
+# this, so it's read from the same [reliability] section by both files.
+RELIABILITY_MODE = CONFIG.get("reliability", "mode", fallback="none").strip().lower()
+GBN_WINDOW_SIZE = CONFIG.getint("reliability", "window_size", fallback=4)
+GBN_RTO = CONFIG.getint("reliability", "rto_ms", fallback=300) / 1000.0
+GBN_MAX_RETRIES = CONFIG.getint("reliability", "max_retries", fallback=30)
+
+HASH_ALGORITHM = CONFIG.get("integrity", "algorithm", fallback="sha256").strip().lower()
+if HASH_ALGORITHM not in ("sha256", "md5"):
+    HASH_ALGORITHM = "sha256"
+
 USERS = {
     "alice": "password123",
     "bob": "hunter2",
 }
 
 # Commands defined by the spec but still not implemented (Excellent Level
-# scope: reliable-UDP-adjacent or integrity/rename/append features). Listed
-# explicitly so the dispatcher has a named slot for each rather than falling
-# through to a generic "unknown command".
-NOT_IMPLEMENTED = {"STOU", "APPE", "DELE", "RNFR", "RNTO", "HASH", "ABOR"}
+# scope: append/rename/unique-store features not needed to demonstrate RDT,
+# congestion control, or integrity verification). Listed explicitly so the
+# dispatcher has a named slot for each rather than falling through to a
+# generic "unknown command".
+NOT_IMPLEMENTED = {"STOU", "APPE", "DELE", "RNFR", "RNTO", "ABOR"}
 
 _session_id_lock = threading.Lock()
 _session_id_counter = itertools.count(1)
@@ -159,13 +173,17 @@ class Session:
 
 
 def _send_over_data_channel(session, data):
-    """Chunk `data` into PKT_DATA packets (terminated by PKT_FIN) and send it
-    to the session's registered client address. Used by RETR and by
+    """Send `data` to the session's registered client address — reliably via
+    Go-Back-N if [reliability] mode=gbn, otherwise the original best-effort
+    framing (checksummed/sequenced, no ACK/retransmit). Used by RETR and by
     LIST/NLST, which stream their listing text over the same UDP data
     channel rather than the control channel."""
     sock, endpoint = session.resolve_data_endpoint()
     if endpoint is None:
         return False
+    if RELIABILITY_MODE == "gbn":
+        return gbn_send(sock, endpoint, data, window_size=GBN_WINDOW_SIZE,
+                         rto=GBN_RTO, max_retries=GBN_MAX_RETRIES)
     seq = 0
     for i in range(0, len(data), CHUNK_SIZE):
         chunk = data[i:i + CHUNK_SIZE]
@@ -188,32 +206,39 @@ def handle_stor(session, filename):
         send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
         return
     send_line(session.conn, Reply.FILE_STATUS_OK)
-    chunks = {}
-    sock.settimeout(SOCK_TIMEOUT)
-    try:
-        while True:
-            raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
-            if addr != expected_addr:
-                # Stray traffic (scan noise, or — under concurrency — another
-                # session sharing this socket in FIXED mode); not this
-                # transfer's data, ignore and keep waiting.
-                continue
-            pkt_type, seq, payload, valid = parse_packet(raw)
-            if not valid:
-                print(f"[!] Corrupt packet seq={seq} dropped.")
-                continue
-            if pkt_type == PKT_FIN:
-                break
-            if pkt_type == PKT_DATA:
-                chunks[seq] = payload
-    except socket.timeout:
-        send_line(session.conn, Reply.TRANSFER_ABORTED)
-        return
+
+    if RELIABILITY_MODE == "gbn":
+        data = gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES)
+        if data is None:
+            send_line(session.conn, Reply.TRANSFER_ABORTED)
+            return
+    else:
+        chunks = {}
+        sock.settimeout(SOCK_TIMEOUT)
+        try:
+            while True:
+                raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
+                if addr != expected_addr:
+                    # Stray traffic (scan noise, or — under concurrency —
+                    # another session sharing this socket in FIXED mode);
+                    # not this transfer's data, ignore and keep waiting.
+                    continue
+                pkt_type, seq, payload, valid = parse_packet(raw)
+                if not valid:
+                    print(f"[!] Corrupt packet seq={seq} dropped.")
+                    continue
+                if pkt_type == PKT_FIN:
+                    break
+                if pkt_type == PKT_DATA:
+                    chunks[seq] = payload
+        except socket.timeout:
+            send_line(session.conn, Reply.TRANSFER_ABORTED)
+            return
+        data = b"".join(chunks[seq] for seq in sorted(chunks))
+
     with open(fs_path, "wb") as f:
-        for seq in sorted(chunks):
-            f.write(chunks[seq])
-    size = sum(len(c) for c in chunks.values())
-    print(f"[+] Stored '{filename}' ({size} bytes) from user '{session.username}'")
+        f.write(data)
+    print(f"[+] Stored '{filename}' ({len(data)} bytes) from user '{session.username}'")
     send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
 
@@ -232,7 +257,9 @@ def handle_retr(session, filename):
     send_line(session.conn, Reply.FILE_STATUS_OK)
     with open(fs_path, "rb") as f:
         data = f.read()
-    _send_over_data_channel(session, data)
+    if not _send_over_data_channel(session, data):
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
+        return
     print(f"[+] Sent '{filename}' ({len(data)} bytes) to user '{session.username}'")
     send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
@@ -304,7 +331,9 @@ def handle_list(session, arg, name_only):
         lines.append(f"{kind}{perms} {size:>10} {name}")
     body = ("\n".join(lines) + "\n" if lines else "").encode("utf-8")
     send_line(session.conn, Reply.FILE_STATUS_OK)
-    _send_over_data_channel(session, body)
+    if not _send_over_data_channel(session, body):
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
+        return
     send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
 
@@ -331,6 +360,20 @@ def handle_mdtm(session, arg):
         return
     ts = time.strftime("%Y%m%d%H%M%S", time.gmtime(os.path.getmtime(fs_path)))
     send_line(session.conn, f"213 {ts}")
+
+
+def handle_hash(session, arg):
+    """Excellent Level: end-to-end integrity verification."""
+    if not arg:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    _, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.isfile(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    with open(fs_path, "rb") as f:
+        data = f.read()
+    send_line(session.conn, f"213 {HASH_ALGORITHM} {compute_hash(data, HASH_ALGORITHM)}")
 
 
 def _bind_session_data_socket(session):
@@ -532,6 +575,12 @@ def handle_client(conn, addr, fixed_udp_sock):
 
                 elif cmd == "MDTM":
                     handle_mdtm(session, arg)
+
+                elif cmd == "HASH":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_hash(session, arg)
 
                 elif cmd == "TYPE":
                     mode = arg.upper()

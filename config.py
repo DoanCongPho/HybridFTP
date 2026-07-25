@@ -26,6 +26,16 @@ _DEFAULTS = {
         "data_mode": "fixed",        # fixed | active | passive
         "download_dir": "client_downloads",
     },
+    "reliability": {
+        "mode": "none",              # none | gbn — MUST match between server and client to interoperate
+        "window_size": "4",          # GBN sliding-window size (flow-control knob)
+        "rto_ms": "300",             # GBN per-packet retransmit timeout, milliseconds
+        "max_retries": "30",         # GBN consecutive-timeout cap before giving up on a transfer
+    },
+    "integrity": {
+        "verify": "false",           # auto MD5/SHA-256 compare after every client put/get
+        "algorithm": "sha256",       # sha256 | md5
+    },
 }
 
 

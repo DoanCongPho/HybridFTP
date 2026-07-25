@@ -1,6 +1,8 @@
 """Shared constants and helpers for the Hybrid FTP control (TCP) and data (UDP) channels."""
 
+import hashlib
 import re
+import socket
 import struct
 import zlib
 
@@ -27,6 +29,8 @@ class DataMode:
 PKT_HELLO = 0   # client -> server: "here is my UDP address, remember it for this session"
 PKT_DATA = 1    # a chunk of file payload
 PKT_FIN = 2     # marks the end of a transfer
+PKT_ACK = 3     # Go-Back-N cumulative ACK (Excellent Level reliable-UDP layer): `seq` is the
+                # highest correctly-received-in-order DATA/FIN seq so far, empty payload
 
 HEADER_FMT = "!BII"       # type(1B) + seq(4B) + checksum(4B)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
@@ -50,6 +54,126 @@ def parse_packet(raw):
     payload = raw[HEADER_SIZE:]
     valid = (zlib.crc32(payload) & 0xFFFFFFFF) == checksum
     return pkt_type, seq, payload, valid
+
+
+# --- Go-Back-N reliable-UDP layer (Excellent Level) ---------------------------
+# Opt-in via config.ini's [reliability] mode=gbn (default "none" = the
+# original best-effort framing above: checksummed and sequenced, but no
+# ACK/retransmit). Both ends of a transfer must agree on the mode — there's
+# no way for one side to "opt out" while the other expects GBN framing, the
+# same way two TCP stacks must speak the same protocol version. Living here
+# (not duplicated in server.py/client.py) is what guarantees that: both
+# STOR/RETR/LIST (server) and put/get/list_dir (client) call the exact same
+# sender/receiver implementation.
+#
+# Sender: a sliding window of up to `window_size` unacknowledged packets in
+# flight (the flow-control knob — the rubric's "Sliding Window" requirement),
+# cumulative ACKs, and a single timer for the oldest unacked packet; on
+# timeout, the whole in-flight window is retransmitted (classic GBN, as
+# opposed to Selective Repeat's per-packet retransmission). The stream's
+# closing PKT_FIN is packet number N (one past the last DATA chunk) and rides
+# the same reliable pipeline, so "transfer complete" is itself acknowledged —
+# unlike the best-effort path, where a lost FIN just means the receiver waits
+# out SOCK_TIMEOUT with no way to tell "done" from "still coming".
+#
+# Receiver: only ever advances on the *next expected* in-order seq; anything
+# else (corrupt, out-of-order, or a duplicate retransmission of an already-
+# acked packet because the sender never saw its ACK) gets the last good
+# cumulative ACK re-sent, never buffered — this is what makes it Go-Back-N
+# rather than Selective Repeat, and why the sender's retransmission always
+# resends the whole window instead of just the missing packet.
+
+GBN_WINDOW_SIZE = 4     # default packets-in-flight; overridden by config.ini [reliability] window_size
+GBN_RTO = 0.3           # default per-packet retransmit timeout (seconds); overridden by rto_ms
+GBN_MAX_RETRIES = 30    # default consecutive-timeout cap before giving up; overridden by max_retries
+
+
+def gbn_send(sock, dest_addr, data, chunk_size=CHUNK_SIZE, window_size=GBN_WINDOW_SIZE,
+             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
+    """Reliably send `data` to dest_addr using Go-Back-N. Returns True once
+    the final PKT_FIN is acknowledged, False if max_retries consecutive
+    timeouts elapse first (peer presumed gone/unreachable)."""
+    packets = []
+    seq = 0
+    for i in range(0, len(data), chunk_size):
+        packets.append(make_packet(PKT_DATA, seq, data[i:i + chunk_size]))
+        seq += 1
+    packets.append(make_packet(PKT_FIN, seq))   # FIN is seq N — part of the same reliable stream
+    total = len(packets)
+
+    base = 0          # oldest seq not yet acknowledged
+    next_seq = 0       # next seq not yet sent
+    retries = 0
+    sock.settimeout(rto)
+
+    def send_window():
+        nonlocal next_seq
+        while next_seq < total and next_seq < base + window_size:
+            sock.sendto(packets[next_seq], dest_addr)
+            next_seq += 1
+
+    send_window()
+    while base < total:
+        try:
+            raw, addr = sock.recvfrom(HEADER_SIZE + 64)
+            if addr != dest_addr:
+                continue
+            pkt_type, ack_seq, _, valid = parse_packet(raw)
+            if not valid or pkt_type != PKT_ACK:
+                continue
+            if ack_seq >= base:
+                base = ack_seq + 1
+                retries = 0
+                send_window()
+        except socket.timeout:
+            retries += 1
+            if retries > max_retries:
+                return False
+            for s in range(base, next_seq):   # GBN: resend the whole in-flight window
+                sock.sendto(packets[s], dest_addr)
+    return True
+
+
+def gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
+    """Reliably receive a Go-Back-N stream from expected_addr. Returns the
+    reassembled payload bytes once PKT_FIN arrives in order, or None if
+    nothing usable arrives for max_retries consecutive rto-second waits."""
+    chunks = []
+    expected_seq = 0
+    idle = 0
+    sock.settimeout(rto)
+    while True:
+        try:
+            raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
+            if addr != expected_addr:
+                continue
+            idle = 0
+            pkt_type, seq, payload, valid = parse_packet(raw)
+            if valid and pkt_type in (PKT_DATA, PKT_FIN) and seq == expected_seq:
+                if pkt_type == PKT_DATA:
+                    chunks.append(payload)
+                sock.sendto(make_packet(PKT_ACK, expected_seq), addr)
+                if pkt_type == PKT_FIN:
+                    return b"".join(chunks)
+                expected_seq += 1
+            elif expected_seq > 0:
+                # Corrupt, out-of-order, or a duplicate the sender re-sent
+                # because our earlier ACK for it was lost — re-ACK the last
+                # good cumulative seq so the sender's window can slide.
+                sock.sendto(make_packet(PKT_ACK, expected_seq - 1), addr)
+            # else: nothing correctly received yet, no valid ACK to send —
+            # stay silent and let the sender's own timeout retry seq 0.
+        except socket.timeout:
+            idle += 1
+            if idle > max_retries:
+                return None
+
+
+def compute_hash(data, algorithm="sha256"):
+    """SHA-256 (default) or MD5 hex digest of `data` — the Excellent Level
+    end-to-end integrity check shared by HASH (server) and the client's
+    optional post-transfer verification."""
+    return hashlib.new(algorithm, data).hexdigest()
 
 
 # --- PORT/PASV address encoding (Advanced Level: Active/Passive mode) --------
@@ -111,7 +235,7 @@ class Reply:
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
     HELP_TEXT = ("214 Commands: USER PASS QUIT NOOP PWD CWD CDUP MKD RMD LIST NLST STAT "
-                 "SIZE MDTM TYPE MODE PORT PASV STOR RETR HELP")
+                 "SIZE MDTM TYPE MODE PORT PASV STOR RETR HASH HELP")
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."

@@ -20,6 +20,7 @@ Commands:
     active                             switch to Active mode (PORT)
     passive                            switch to Passive mode (PASV)
     fixed                              switch back to Basic Level fixed mode
+    hash <filename>                    server-side MD5/SHA-256 of a file
     pwd
     size <filename>
     noop
@@ -37,6 +38,7 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
+    gbn_send, gbn_receive, compute_hash,
 )
 from config import CONFIG
 
@@ -46,6 +48,20 @@ DOWNLOAD_DIR = (DOWNLOAD_DIR_CFG if os.path.isabs(DOWNLOAD_DIR_CFG)
 
 _DEFAULT_DATA_MODE = CONFIG.get("client", "data_mode", fallback="fixed").strip().lower()
 _MODE_MAP = {"fixed": DataMode.FIXED, "active": DataMode.ACTIVE, "passive": DataMode.PASSIVE}
+
+# Excellent Level: Go-Back-N reliable-UDP layer. "none" (default) preserves
+# the exact best-effort framing above; must match server.py's [reliability]
+# setting to interoperate — see the comment above gbn_send() in common.py.
+RELIABILITY_MODE = CONFIG.get("reliability", "mode", fallback="none").strip().lower()
+GBN_WINDOW_SIZE = CONFIG.getint("reliability", "window_size", fallback=4)
+GBN_RTO = CONFIG.getint("reliability", "rto_ms", fallback=300) / 1000.0
+GBN_MAX_RETRIES = CONFIG.getint("reliability", "max_retries", fallback=30)
+
+# Excellent Level: end-to-end MD5/SHA-256 hash verification.
+VERIFY_HASH = CONFIG.getboolean("integrity", "verify", fallback=False)
+HASH_ALGORITHM = CONFIG.get("integrity", "algorithm", fallback="sha256").strip().lower()
+if HASH_ALGORITHM not in ("sha256", "md5"):
+    HASH_ALGORITHM = "sha256"
 
 
 class FTPClient:
@@ -154,9 +170,16 @@ class FTPClient:
 
     def _recv_data_payload(self):
         """Receive one data-channel transfer (PKT_DATA... PKT_FIN) and
-        reassemble it in sequence order. Used by both get() (saved to a
-        file) and list_dir() (printed to stdout) — RETR/LIST/NLST all use
-        the same UDP framing on the server side."""
+        reassemble it in sequence order — reliably via Go-Back-N if
+        [reliability] mode=gbn, otherwise the original best-effort framing.
+        Used by both get() (saved to a file) and list_dir() (printed to
+        stdout) — RETR/LIST/NLST all use the same UDP framing server-side."""
+        if RELIABILITY_MODE == "gbn":
+            data = gbn_receive(self.udp_sock, self._data_target(), rto=GBN_RTO,
+                                max_retries=GBN_MAX_RETRIES)
+            if data is None:
+                print("[!] Data transfer timed out.")
+            return data
         chunks = {}
         self.udp_sock.settimeout(SOCK_TIMEOUT)
         try:
@@ -187,13 +210,21 @@ class FTPClient:
         with open(local_path, "rb") as f:
             data = f.read()
         target = self._data_target()
-        seq = 0
-        for i in range(0, len(data), CHUNK_SIZE):
-            chunk = data[i:i + CHUNK_SIZE]
-            self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
-            seq += 1
-        self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
+        if RELIABILITY_MODE == "gbn":
+            if not gbn_send(self.udp_sock, target, data, window_size=GBN_WINDOW_SIZE,
+                             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
+                print("[!] Upload failed: server did not acknowledge (timed out).")
+                return
+        else:
+            seq = 0
+            for i in range(0, len(data), CHUNK_SIZE):
+                chunk = data[i:i + CHUNK_SIZE]
+                self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
+                seq += 1
+            self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
         print(self._read_reply())
+        if VERIFY_HASH:
+            self._verify_hash(remote_name, data)
 
     def get(self, remote_name, local_path=None):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -209,6 +240,31 @@ class FTPClient:
             f.write(data)
         print(f"[+] Saved to {local_path} ({len(data)} bytes)")
         print(self._read_reply())
+        if VERIFY_HASH:
+            self._verify_hash(remote_name, data)
+
+    def hash_remote(self, remote_name):
+        """`hash` REPL command — always works standalone regardless of the
+        [integrity] verify config, unlike _verify_hash() which is only the
+        automatic post-transfer check."""
+        return self.command(f"HASH {remote_name}")
+
+    def _verify_hash(self, remote_name, local_data):
+        """Excellent Level: compare a locally-known hash against the
+        server's HASH reply for the same file — used right after put() (we
+        already have the bytes we just sent) and get() (the bytes we just
+        saved)."""
+        local_hash = compute_hash(local_data, HASH_ALGORITHM)
+        reply = self.hash_remote(remote_name)
+        m = re.match(r"213 (\S+) ([0-9a-fA-F]+)", reply)
+        if not m or m.group(1).lower() != HASH_ALGORITHM:
+            print(f"[!] Could not verify integrity: unexpected HASH reply {reply!r}")
+            return
+        if m.group(2).lower() == local_hash.lower():
+            print(f"[+] Integrity verified ({HASH_ALGORITHM}): MATCH ({local_hash})")
+        else:
+            print(f"[!] INTEGRITY CHECK FAILED ({HASH_ALGORITHM}): "
+                  f"local={local_hash} server={m.group(2)}")
 
     def list_dir(self, path="", name_only=False):
         cmd = "NLST" if name_only else "LIST"
@@ -298,6 +354,11 @@ def repl(host):
                 client.set_passive()
             elif cmd == "fixed":
                 client.set_fixed()
+            elif cmd == "hash":
+                if not arg:
+                    print("Usage: hash <filename>")
+                    continue
+                print(client.hash_remote(arg))
             elif cmd == "pwd":
                 print(client.command("PWD"))
             elif cmd == "size":

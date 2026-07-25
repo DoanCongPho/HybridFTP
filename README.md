@@ -3,12 +3,14 @@
 A Hybrid FTP client/server: TCP control channel + UDP data channel,
 implemented from scratch with Python's standard `socket` module only.
 
-Implements **Basic Level** end to end, plus all four **Advanced Level**
-rubric items — binary transfer, a real directory tree, Active/Passive mode
-switching, and a concurrent (multi-threaded) server. Advanced techniques are
-**opt-in via `config.ini`**: with no config file (or its defaults), the
-server and client behave exactly like Basic Level. See "Configuration"
-below.
+Implements **Basic Level** end to end, all four **Advanced Level** rubric
+items — binary transfer, a real directory tree, Active/Passive mode
+switching, and a concurrent (multi-threaded) server — and all three
+**Excellent Level** items: a custom Go-Back-N reliable-UDP layer, sliding-
+window flow control, and end-to-end MD5/SHA-256 integrity verification.
+Every technique past Basic Level is **opt-in via `config.ini`**: with no
+config file (or its defaults), the server and client behave exactly like
+Basic Level. See "Configuration" below.
 
 ## Running
 
@@ -56,6 +58,13 @@ passive                            switch to Passive mode (PASV)
 fixed                              switch back to Basic Level fixed mode
 ```
 
+**Excellent Level** — reliable-UDP transfer and integrity verification:
+```
+hash <filename>                    server-side MD5/SHA-256 of a file
+```
+(`put`/`get` also run this automatically and print MATCH/MISMATCH when
+`config.ini`'s `[integrity] verify = true`.)
+
 ### Example session
 ```
 ftp> user alice
@@ -93,12 +102,29 @@ advertise_ip =          ; PASV-announced IP override, for NAT/cloud VMs
 [client]
 data_mode = fixed        ; fixed | active | passive — data-channel default
 download_dir = client_downloads
+
+[reliability]
+mode = none               ; none | gbn — MUST match between server and client
+window_size = 4           ; GBN sliding-window size (flow-control knob)
+rto_ms = 300               ; GBN per-packet retransmit timeout
+max_retries = 30           ; GBN consecutive-timeout cap before giving up
+
+[integrity]
+verify = false             ; auto MD5/SHA-256 compare after every put/get
+algorithm = sha256          ; sha256 | md5
 ```
 
 `data_mode` only sets the client's *default* at login — it can still be
 switched live in the REPL with `active` / `passive` / `fixed`, satisfying
 the rubric's "Active/Passive mode switching" requirement as a genuine
 runtime choice, not just a static setting.
+
+`[reliability] mode` must be set the same way on **both** `server.py` and
+`client.py`'s `config.ini` — there's no negotiation handshake for it (unlike
+`data_mode`, which is negotiated live via `PORT`/`PASV`), the same way two
+real TCP stacks have to speak the same protocol version. `hash <filename>`
+and `[integrity] verify` work independently of `[reliability] mode` — you
+can run hash verification over either the best-effort or the GBN transport.
 
 ### Config presets by level
 
@@ -138,6 +164,31 @@ work live in the REPL regardless of this default):
 [client]
 data_mode = active
 ```
+
+**Excellent Level demo** — everything above, plus Go-Back-N and automatic
+hash verification. Set identically on both server and client:
+```ini
+[server]
+threading = thread
+
+[client]
+data_mode = passive
+
+[reliability]
+mode = gbn
+window_size = 4
+rto_ms = 300
+max_retries = 30
+
+[integrity]
+verify = true
+algorithm = sha256
+```
+To actually *see* GBN recovering from loss rather than just running with
+zero drops (loopback/LAN rarely drops packets on its own), demo it across a
+real lossy path (e.g. the Azure VM setup in `docs/GENAI_LOG.md`) or narrate
+the retransmit counters — every retransmitted window is a real timeout
+firing, not simulated.
 
 ## Architecture
 
@@ -186,19 +237,74 @@ lock-protected table (`_active_sessions`) tracks who's connected — printed
 to the server log on every connect/disconnect, satisfying the "server log
 displays connected client IPs... and active session table" requirement.
 
-## Deliberately not implemented (Excellent Level scope)
+### Reliable-UDP layer (Go-Back-N)
 
-Left out on purpose — see the assignment's Excellent Level tier:
-- Full reliable-UDP layer: no ACK/timeout/retransmit, no sliding window /
-  congestion control. Packets carry a checksum and sequence number (dropped
-  if corrupt, reordered on receipt) but a lost packet is **not** recovered.
-- End-to-end hash verification (`HASH`), `STOU`, `APPE`, `DELE`,
-  `RNFR`/`RNTO`, `MODE B`/`MODE C`
+Opt-in via `[reliability] mode = gbn` (default `none` = the original
+best-effort framing: checksummed and sequenced, but no ACK/retransmit — a
+lost packet silently truncates the transfer). The whole state machine lives
+once in `common.py`'s `gbn_send()`/`gbn_receive()`, reused identically by
+both `server.py` (STOR/RETR/LIST/NLST) and `client.py` (`put`/`get`/`ls`) —
+both ends of a transfer must run the same mode to interoperate, the same way
+two TCP stacks must speak the same protocol version.
 
-## Known limitation
+- **Sender**: a sliding window of up to `window_size` unacknowledged packets
+  in flight (the flow-control knob — the rubric's separate "Sliding Window"
+  requirement, satisfied by the same mechanism as the RDT requirement) and a
+  single timer for the oldest unacked packet. On timeout, the **whole**
+  in-flight window is retransmitted — this is what makes it Go-Back-N rather
+  than Selective Repeat.
+- **Receiver**: only ever advances on the next expected in-order sequence
+  number; anything else (corrupt, out-of-order, or a duplicate retransmit
+  because the sender never saw our earlier ACK) gets the last good
+  cumulative ACK re-sent, never buffered.
+- The closing `PKT_FIN` is packet number *N* and rides the same reliable
+  pipeline as the data chunks, so "transfer complete" is itself acknowledged
+  — unlike the best-effort path, where a lost FIN just means the receiver
+  waits out `SOCK_TIMEOUT` with no way to tell "done" from "still coming".
+- If `max_retries` consecutive timeouts elapse without progress, the sender
+  gives up and the transfer is reported as aborted (`426`) rather than
+  hanging forever or silently claiming success — verified with a throwaway
+  test harness that randomly drops both DATA and ACK packets at up to 50%
+  simultaneous loss and confirmed the layer never reports success on
+  corrupted/incomplete data, only ever a correctly-reassembled transfer or
+  an honest failure.
 
-Because there is no retransmission, a UDP packet lost in transit (rare on
-loopback/LAN, more likely over a lossy real-world path) will silently
-truncate a transfer. Demonstrated and tested over loopback and a real
-network path (Azure VM); no losses observed in testing, but this is not a
-guarantee — see "Deliberately not implemented" above.
+### Data integrity verification
+
+`HASH <filename>` (`common.compute_hash`, SHA-256 by default, MD5 available
+via `[integrity] algorithm`) computes a digest of the file as stored on the
+server. The `hash` REPL command always works standalone; `[integrity]
+verify = true` additionally runs it automatically after every `put`/`get` —
+the client hashes the bytes it just sent/received locally, asks the server
+for its hash of the same file, and prints `MATCH`/`INTEGRITY CHECK FAILED`.
+This works independently of `[reliability] mode` — hash verification and
+the transport reliability mode are orthogonal opt-in techniques.
+
+## Deliberately not implemented
+
+Left out on purpose:
+- **Selective Repeat** as an alternative to Go-Back-N — more bandwidth-
+  efficient (only the lost packet is retransmitted, not the whole window)
+  but requires receiver-side out-of-order buffering and per-packet ACK
+  tracking; Go-Back-N was chosen for a coherent, single mechanism that
+  satisfies both the RDT and sliding-window rubric items with less state to
+  get right and explain live in the oral defense.
+- **Adaptive/dynamic congestion control** (TCP-Reno-style slow start, AIMD,
+  timeout-based window shrinking) — `window_size` is a fixed, configurable
+  knob (satisfies "Sliding Window **or equivalent** mechanism to prevent
+  network flooding" per the spec), not a self-tuning algorithm.
+- `STOU`, `APPE`, `DELE`, `RNFR`/`RNTO`, `MODE B`/`MODE C`, `ABOR`
+
+## Known limitations
+
+- With the default `[reliability] mode = none`, a UDP packet lost in transit
+  (rare on loopback/LAN, more likely over a lossy real-world path) still
+  silently truncates a transfer — this is the documented Basic/Advanced
+  Level behavior, unchanged unless `mode = gbn` is opted into.
+- Go-Back-N's whole-window retransmission is less bandwidth-efficient under
+  loss than Selective Repeat would be (see "Deliberately not implemented"
+  above) — a deliberate simplicity/efficiency trade-off, not an oversight.
+- `[reliability] mode` has no negotiation handshake (unlike `data_mode`,
+  negotiated live via `PORT`/`PASV`) — both ends must be configured with the
+  same value ahead of time, or a GBN-speaking peer talking to a best-effort
+  peer will simply see its ACKs/retransmits go unrecognized and time out.
