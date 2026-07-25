@@ -40,6 +40,18 @@ else:
 THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single | thread
 ADVERTISE_IP = CONFIG.get("server", "advertise_ip", fallback="").strip()
 
+# Port range for per-session ACTIVE/PASSIVE UDP sockets. Blank (the default)
+# means "let the OS pick any free ephemeral port" — fine on a LAN/loopback,
+# but behind a cloud NSG/firewall that only opens a couple of fixed ports,
+# a random port gets silently dropped before it reaches this process. Setting
+# both bounds restricts binding to that range so only it needs to be opened
+# on the firewall once (mirrors vsftpd's pasv_min_port/pasv_max_port).
+_pasv_min_raw = CONFIG.get("server", "passive_port_min", fallback="").strip()
+_pasv_max_raw = CONFIG.get("server", "passive_port_max", fallback="").strip()
+PASSIVE_PORT_RANGE = (
+    (int(_pasv_min_raw), int(_pasv_max_raw)) if _pasv_min_raw and _pasv_max_raw else None
+)
+
 USERS = {
     "alice": "password123",
     "bob": "hunter2",
@@ -321,6 +333,27 @@ def handle_mdtm(session, arg):
     send_line(session.conn, f"213 {ts}")
 
 
+def _bind_session_data_socket(session):
+    """Open a fresh UDP socket for a per-session (ACTIVE/PASSIVE) data
+    channel, bound either to an OS-assigned ephemeral port (default) or to
+    a free port within PASSIVE_PORT_RANGE if configured. Returns None if
+    every port in a configured range is already taken."""
+    ip = session.conn.getsockname()[0]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if PASSIVE_PORT_RANGE is None:
+        sock.bind((ip, 0))
+        return sock
+    lo, hi = PASSIVE_PORT_RANGE
+    for port in range(lo, hi + 1):
+        try:
+            sock.bind((ip, port))
+            return sock
+        except OSError:
+            continue  # port already in use by another concurrent session, try the next one
+    sock.close()
+    return None
+
+
 def handle_pasv(session):
     """PASV: open a fresh per-session UDP socket, tell the client where it
     lives, then wait for the client's HELLO on it to learn the client's
@@ -328,8 +361,10 @@ def handle_pasv(session):
     instead of the shared DATA_PORT, which is what gives concurrent sessions
     isolated data channels."""
     session.close_data_socket()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((session.conn.getsockname()[0], 0))
+    sock = _bind_session_data_socket(session)
+    if sock is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
     session.data_sock = sock
     session.owns_data_sock = True
     session.data_mode = DataMode.PASSIVE
@@ -360,8 +395,10 @@ def handle_port(session, arg):
         send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
         return
     session.close_data_socket()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((session.conn.getsockname()[0], 0))
+    sock = _bind_session_data_socket(session)
+    if sock is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
     session.data_sock = sock
     session.owns_data_sock = True
     session.data_mode = DataMode.ACTIVE

@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import socket
+import time
 
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
@@ -280,7 +281,15 @@ def repl(host):
             elif cmd == "stat":
                 print(client.command(f"STAT {arg}".strip()))
             elif cmd == "mdtm":
-                print(client.command(f"MDTM {arg}"))
+                reply = client.command(f"MDTM {arg}")
+                print(reply)
+                # The wire format (YYYYMMDDhhmmss) is the exact one the spec
+                # requires for MDTM — reformat only for display, don't touch
+                # what's sent/received on the wire.
+                m = re.match(r"213 (\d{14})", reply)
+                if m:
+                    t = time.strptime(m.group(1), "%Y%m%d%H%M%S")
+                    print(f"[+] Last modified: {time.strftime('%Y-%m-%d %H:%M:%S', t)} UTC")
             elif cmd == "type":
                 print(client.command(f"TYPE {arg or 'A'}"))
             elif cmd == "active":

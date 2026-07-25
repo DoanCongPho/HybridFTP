@@ -19,6 +19,8 @@ _DEFAULTS = {
         "threading": "single",       # single | thread
         "storage_root": "server_storage",
         "advertise_ip": "",          # override the IP announced in PASV replies (e.g. a cloud VM's public IP behind NAT); blank = auto-detect
+        "passive_port_min": "",      # restrict ACTIVE/PASSIVE per-session sockets to [min, max] (both required together); blank = any OS-assigned ephemeral port
+        "passive_port_max": "",
     },
     "client": {
         "data_mode": "fixed",        # fixed | active | passive
