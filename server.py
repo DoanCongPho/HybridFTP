@@ -28,7 +28,7 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_port_arg, recv_line, send_line,
-    gbn_send, gbn_receive, compute_hash,
+    gbn_send, gbn_receive, compute_hash, drain_stale_packets,
 )
 from config import CONFIG
 
@@ -182,8 +182,11 @@ def _send_over_data_channel(session, data):
     if endpoint is None:
         return False
     if RELIABILITY_MODE == "gbn":
+        def _log_retransmit(base, next_seq, retries):
+            print(f"[GBN] retransmit window seq={base}..{next_seq - 1} "
+                  f"(retry #{retries}) to {endpoint} — real packet loss detected")
         return gbn_send(sock, endpoint, data, window_size=GBN_WINDOW_SIZE,
-                         rto=GBN_RTO, max_retries=GBN_MAX_RETRIES)
+                         rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=_log_retransmit)
     seq = 0
     for i in range(0, len(data), CHUNK_SIZE):
         chunk = data[i:i + CHUNK_SIZE]
@@ -205,10 +208,19 @@ def handle_stor(session, filename):
     if expected_addr is None:
         send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
         return
+    # Drain BEFORE telling the client to start sending (FILE_STATUS_OK) — the
+    # client could start firing data the instant it sees "150", so draining
+    # any later point risks discarding this transfer's own first packets on
+    # a fast/local network. See common.gbn_receive()'s docstring.
+    drain_stale_packets(sock)
     send_line(session.conn, Reply.FILE_STATUS_OK)
 
     if RELIABILITY_MODE == "gbn":
-        data = gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES)
+        def _log_reack(expected_seq, got_seq):
+            print(f"[GBN] out-of-order/duplicate/corrupt from {expected_addr} "
+                  f"(expected seq={expected_seq}, got={got_seq}) — re-ACKing {expected_seq - 1}")
+        data = gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES,
+                            on_reack=_log_reack)
         if data is None:
             send_line(session.conn, Reply.TRANSFER_ABORTED)
             return

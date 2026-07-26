@@ -38,7 +38,7 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
-    gbn_send, gbn_receive, compute_hash,
+    gbn_send, gbn_receive, compute_hash, drain_stale_packets,
 )
 from config import CONFIG
 
@@ -173,10 +173,20 @@ class FTPClient:
         reassemble it in sequence order — reliably via Go-Back-N if
         [reliability] mode=gbn, otherwise the original best-effort framing.
         Used by both get() (saved to a file) and list_dir() (printed to
-        stdout) — RETR/LIST/NLST all use the same UDP framing server-side."""
+        stdout) — RETR/LIST/NLST all use the same UDP framing server-side.
+
+        Callers must drain_stale_packets() themselves *before* sending the
+        RETR/LIST/NLST request (not here) — the server may start sending the
+        instant it sees our request, so draining at this point risks
+        discarding this transfer's own first packets on a fast/local network."""
         if RELIABILITY_MODE == "gbn":
-            data = gbn_receive(self.udp_sock, self._data_target(), rto=GBN_RTO,
-                                max_retries=GBN_MAX_RETRIES)
+            target = self._data_target()
+
+            def _log_reack(expected_seq, got_seq):
+                print(f"[GBN] out-of-order/duplicate/corrupt from {target} "
+                      f"(expected seq={expected_seq}, got={got_seq}) — re-ACKing {expected_seq - 1}")
+            data = gbn_receive(self.udp_sock, target, rto=GBN_RTO,
+                                max_retries=GBN_MAX_RETRIES, on_reack=_log_reack)
             if data is None:
                 print("[!] Data transfer timed out.")
             return data
@@ -211,8 +221,11 @@ class FTPClient:
             data = f.read()
         target = self._data_target()
         if RELIABILITY_MODE == "gbn":
+            def _log_retransmit(base, next_seq, retries):
+                print(f"[GBN] retransmit window seq={base}..{next_seq - 1} "
+                      f"(retry #{retries}) to {target} — real packet loss detected")
             if not gbn_send(self.udp_sock, target, data, window_size=GBN_WINDOW_SIZE,
-                             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
+                             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=_log_retransmit):
                 print("[!] Upload failed: server did not acknowledge (timed out).")
                 return
         else:
@@ -229,12 +242,22 @@ class FTPClient:
     def get(self, remote_name, local_path=None):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         local_path = local_path or os.path.join(DOWNLOAD_DIR, remote_name)
+        # Drain BEFORE asking — once the server sees RETR it may start
+        # sending immediately, so draining any later risks discarding this
+        # transfer's own first packets on a fast/local network.
+        drain_stale_packets(self.udp_sock)
         reply = self.command(f"RETR {remote_name}")
         print(reply)
         if not reply.startswith("150"):
             return
         data = self._recv_data_payload()
         if data is None:
+            # The server still sends a final control-channel reply
+            # regardless of whether our UDP receive succeeded (unconditionally
+            # in best-effort mode; 426 once its own retry budget is exhausted
+            # in GBN mode) — read and discard it now, or it gets misread as
+            # the reply to whatever command runs next, desyncing the session.
+            print(self._read_reply())
             return
         with open(local_path, "wb") as f:
             f.write(data)
@@ -268,12 +291,14 @@ class FTPClient:
 
     def list_dir(self, path="", name_only=False):
         cmd = "NLST" if name_only else "LIST"
+        drain_stale_packets(self.udp_sock)
         reply = self.command(f"{cmd} {path}".strip())
         print(reply)
         if not reply.startswith("150"):
             return
         data = self._recv_data_payload()
         if data is None:
+            print(self._read_reply())  # drain the pending final reply — see get()'s comment
             return
         text = data.decode("utf-8", errors="replace")
         print(text if text else "(empty)")

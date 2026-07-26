@@ -56,6 +56,30 @@ def parse_packet(raw):
     return pkt_type, seq, payload, valid
 
 
+def drain_stale_packets(sock):
+    """Discard any datagrams already sitting in `sock`'s receive buffer
+    before starting a new data-channel operation.
+
+    FIXED mode reuses one UDP socket for an entire session (or, server-side,
+    the whole server lifetime) rather than opening a fresh one per transfer.
+    Packet `seq` numbers reset to 0 for every new STOR/RETR/LIST/etc — there
+    is no other field identifying which logical transfer a packet belongs
+    to. Over a real network, a straggler packet from a *previous* transfer
+    (e.g. one the receiver already gave up on after a timeout, but the
+    sender fired anyway with no ACK to know better) can still be in flight
+    or unread in the OS socket buffer when the *next* command starts — and
+    gets misread as belonging to the new transfer, silently corrupting it
+    with leftover data from the old one. Call this right before a receive
+    loop starts (both gbn_receive() and the best-effort paths in
+    server.py/client.py) to guarantee a clean slate."""
+    sock.settimeout(0)
+    try:
+        while True:
+            sock.recvfrom(CHUNK_SIZE + 64)
+    except (BlockingIOError, socket.timeout):
+        pass
+
+
 # --- Go-Back-N reliable-UDP layer (Excellent Level) ---------------------------
 # Opt-in via config.ini's [reliability] mode=gbn (default "none" = the
 # original best-effort framing above: checksummed and sequenced, but no
@@ -89,10 +113,21 @@ GBN_MAX_RETRIES = 30    # default consecutive-timeout cap before giving up; over
 
 
 def gbn_send(sock, dest_addr, data, chunk_size=CHUNK_SIZE, window_size=GBN_WINDOW_SIZE,
-             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
+             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=None):
     """Reliably send `data` to dest_addr using Go-Back-N. Returns True once
     the final PKT_FIN is acknowledged, False if max_retries consecutive
-    timeouts elapse first (peer presumed gone/unreachable)."""
+    timeouts elapse first (peer presumed gone/unreachable).
+
+    Drains any stale packets (e.g. a late duplicate ACK from a *previous*
+    gbn_send() call on this same socket) before sending anything — safe to
+    do here, unlike on the receive side, because at this exact point nothing
+    has been sent yet for this call, so nothing genuine could be waiting.
+
+    `on_retransmit(base, next_seq, retries)`, if given, is called every time
+    an RTO fires and the in-flight window gets resent — purely observational
+    (e.g. for demo logging of real packet loss recovery), never affects the
+    protocol's own correctness."""
+    drain_stale_packets(sock)
     packets = []
     seq = 0
     for i in range(0, len(data), chunk_size):
@@ -129,15 +164,29 @@ def gbn_send(sock, dest_addr, data, chunk_size=CHUNK_SIZE, window_size=GBN_WINDO
             retries += 1
             if retries > max_retries:
                 return False
+            if on_retransmit:
+                on_retransmit(base, next_seq, retries)
             for s in range(base, next_seq):   # GBN: resend the whole in-flight window
                 sock.sendto(packets[s], dest_addr)
     return True
 
 
-def gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
+def gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_reack=None):
     """Reliably receive a Go-Back-N stream from expected_addr. Returns the
     reassembled payload bytes once PKT_FIN arrives in order, or None if
-    nothing usable arrives for max_retries consecutive rto-second waits."""
+    nothing usable arrives for max_retries consecutive rto-second waits.
+
+    Does NOT drain the socket itself — unlike gbn_send(), by the time a
+    receiver is invoked the peer may already be sending (it was just told to
+    start), so draining here on a fast/local network can discard genuinely
+    fresh packets that arrived before this call started. The caller must
+    drain *before* announcing readiness to the peer (before replying 150 /
+    before sending the request) instead — see handle_stor()/get()/list_dir().
+
+    `on_reack(expected_seq, got_seq)`, if given, is called whenever we have to
+    re-send the last cumulative ACK because of a corrupt/out-of-order/duplicate
+    arrival — purely observational (e.g. for demo logging that real loss was
+    detected and handled), never affects the protocol's own correctness."""
     chunks = []
     expected_seq = 0
     idle = 0
@@ -160,6 +209,8 @@ def gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES):
                 # Corrupt, out-of-order, or a duplicate the sender re-sent
                 # because our earlier ACK for it was lost — re-ACK the last
                 # good cumulative seq so the sender's window can slide.
+                if on_reack:
+                    on_reack(expected_seq, seq if valid else None)
                 sock.sendto(make_packet(PKT_ACK, expected_seq - 1), addr)
             # else: nothing correctly received yet, no valid ACK to send —
             # stay silent and let the sender's own timeout retry seq 0.

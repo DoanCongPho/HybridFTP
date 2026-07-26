@@ -371,3 +371,166 @@ hands it to `parse_port_arg`, used client-side (`set_passive()`) when receiving 
   Live Coding, regardless of whether the code itself works.
 
 ---
+
+## Entry 12 — Excellent Level implementation (Go-Back-N + integrity verification)
+
+**Prompt used:**
+> good everything work correctly now move to excellent level
+> '/Users/doancongpho/Documents/Hcmus Education/Junior/Term 3/Internetworking protocol/Socket/Project1_SocketProgramming_2026.pdf'
+
+**Raw GenAI output (summary of actions taken):**
+Before writing code, the AI flagged that the Excellent Level rubric (Section 1.3 of the spec) names three
+required items — a custom reliable-UDP layer (RDT: ACKs, sequence numbers, timeout/retransmit, explicitly
+offering Stop-and-Wait, Go-Back-N, or Selective Repeat as valid choices), sliding-window congestion/flow
+control, and end-to-end MD5/SHA-256 integrity verification — and asked which RDT algorithm to build,
+since the choice materially changes the packet format and both `server.py` and `client.py`. It recommended
+Go-Back-N specifically because a single mechanism (one retransmit timer for the oldest unacked packet,
+whole-window retransmission on timeout) satisfies both the RDT bullet and the separate sliding-window
+bullet at once, versus Stop-and-Wait (no inherent window) or Selective Repeat (more state: per-packet ACK
+tracking, receiver-side out-of-order buffering). The student chose Go-Back-N.
+
+The AI then implemented, across all four files:
+- `common.py`: a new `PKT_ACK` packet type (reusing the existing 9-byte header, no wire-format change);
+  `gbn_send()`/`gbn_receive()` as the *single* shared Go-Back-N sender/receiver implementation (sliding
+  window, cumulative ACK, one timer for the oldest unacked packet that retransmits the whole in-flight
+  window on timeout, `PKT_FIN` folded into the same reliable stream as packet number N rather than sent
+  unacknowledged); `compute_hash()` shared by both HASH's server and client sides.
+- `config.py`/`config.ini`: new `[reliability]` (`mode = none|gbn`, `window_size`, `rto_ms`, `max_retries`)
+  and `[integrity]` (`verify = true|false`, `algorithm = sha256|md5`) sections, both defaulting to exactly
+  the old best-effort/no-verification behavior — appended to the student's live-deployment `config.ini`
+  (which already had a real Azure VM IP and a passive port range set) without disturbing existing values.
+- `server.py`: `_send_over_data_channel()`/`handle_stor()` branch on `RELIABILITY_MODE`; new `handle_hash()`
+  and a `HASH` dispatcher branch (removed from `NOT_IMPLEMENTED`).
+- `client.py`: `put()`/`_recv_data_payload()` branch the same way; new `hash_remote()`/`_verify_hash()` and
+  a `hash` REPL command; `[integrity] verify` auto-runs verification after every `put`/`get`.
+
+**Refinement & problem solving:**
+- **Did not just trust the algorithm "looked right" — built an adversarial test.** Before touching
+  `server.py`/`client.py` at all, the AI wrote a throwaway test harness
+  (`/private/tmp/.../scratchpad/test_gbn.py`, not committed) that wraps a UDP socket's `sendto()` to
+  randomly drop packets, and ran `gbn_send()`/`gbn_receive()` against it at 10–50% *simultaneous
+  bidirectional* loss (both DATA and ACK packets dropped independently). One trial at 50% loss with the
+  default `max_retries=50` initially reported as a naive "FAIL" — investigated and confirmed this was
+  *correct* behavior (the sender's retry budget was legitimately exhausted while the receiver had, by
+  chance, already fully reassembled the file — a case where the sender's own ACK confirmation was lost,
+  not a data-integrity bug). The test's success criterion was corrected to the property that actually
+  matters for an RDT layer: `gbn_send()` must never report success on corrupted/incomplete data (zero
+  false positives), which held across every trial, including 10 repeated runs at 15% loss and an extreme
+  50%-loss run given a larger retry budget to confirm it can still succeed given enough patience.
+- **Full integration re-tested after the isolated algorithm passed**, not assumed to follow from it: a
+  real `server.py`/`client.py` session over loopback with `mode=gbn` and `verify=true` (put/get/hash all
+  matching, byte-`diff`-verified), `LIST`/`NLST` under GBN (they reuse the same send helper), a deliberate
+  hash-mismatch check (querying `HASH` against a different file to confirm the digest actually changes,
+  not just always reporting MATCH), and a full regression pass confirming `mode=none` (the untouched
+  default) still behaves byte-identically to before this session.
+- **Config changes were tested in isolation, then the student's real `config.ini` was restored exactly** —
+  backed up before flipping `mode`/`verify`/`advertise_ip` for local testing (the live VM's `advertise_ip`
+  would have broken loopback testing otherwise), restored after, and the diff was inspected
+  (`git diff config.ini`) to confirm only the new `[reliability]`/`[integrity]` sections were added with
+  nothing else touched.
+- **Deliberately rejected scope creep**: Selective Repeat and adaptive/AIMD-style congestion control were
+  both explicitly named and explicitly not implemented, with the reasoning (more receiver-side state;
+  spec's "sliding window *or equivalent*" wording already satisfied by a fixed configurable window)
+  recorded directly in the code comments and README rather than silently left out.
+- `[student to fill in]`: independently re-derive why Go-Back-N retransmits the *whole* window on a single
+  lost packet while Selective Repeat would not — this is the single most likely oral-viva question given
+  the rubric's explicit "Flawless mastery of RDT states (Stop-and-Wait, GBN, SR)" line at the Excellent
+  tier.
+
+---
+
+## Entry 13 — Post-implementation code walkthrough (Q&A)
+
+**Prompt used (paraphrased sequence of follow-up questions, same session):**
+> NOT_IMPLEMENTED = {...} những thứ đã build là đủ cho assignment chưa hay còn thiếu gì k
+> [selection: `f.write(data)` / stored-file logging line] ... đã bỏ đi thứ tự của chunk rồi đúng k vậy thì
+> nếu không dùng gbn thì sẽ không ghép lại data được à?
+> [selection: `packets.append(make_packet(PKT_FIN, seq))`] dòng này là sao
+> [selection: `def recv_line(conn):`] này làm gì
+> [selection: `self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)`] conn ở client là control
+> channel ak
+> control channel qua ba level thay đổi ra sao
+
+**Raw GenAI output (summary):**
+A run of pure code-comprehension questions, no code changes. The AI: (1) audited the full spec against
+what's built and reported the gap honestly — `STOU`/`APPE`/`DELE`/`RNFR`/`RNTO`/`ABOR`/`MODE B`/`MODE C`
+are unimplemented but not named by any Section 1.3 rubric bullet, flagged that the PDF's own "Level"
+column for the command table wasn't legible in what was extracted (so this is an inference, not a
+confirmed fact), and separately flagged a real risk: the spec's literal wording "fully isolates client
+sessions" is not met by FIXED-mode concurrency (a disclosed, existing limitation), so demos should use
+Active/Passive mode. It also pointed out that most of the *assignment* (the 7-section technical report)
+was still missing, not just code. (2) Confirmed the non-GBN `handle_stor` path still reorders chunks via
+`sorted(chunks)` exactly as before — nothing was lost in the refactor, only consolidated so both branches
+share one `f.write(data)` call. (3) Explained that `PKT_FIN`'s `seq` number is deliberately set to one past
+the last DATA chunk so it rides in the *same* `packets` array as GBN's sliding window/ACK/retransmit
+logic, making "transfer complete" itself reliable instead of a fire-and-forget UDP send. (4) Explained
+`recv_line()`'s byte-at-a-time TCP read loop and its `\r`/`\n` handling. (5) Confirmed `self.conn` is the
+TCP control socket (vs. `self.udp_sock` for data) by pointing at `SOCK_STREAM` and the `control_port`
+argument. (6) Summarized how the control-channel command set grew across Basic → Advanced → Excellent,
+with the key observation that Excellent Level's RDT layer adds *no* new control-channel commands or
+replies at all (only `HASH` is new) — GBN vs. best-effort is decided entirely out-of-band via
+`config.ini`, invisible on the control-channel wire, by deliberate design (documented in Entry 12).
+
+**Refinement & problem solving:**
+- These were verification questions, not blind acceptance — each answer was checked against the actual
+  current line numbers/content of the file open in the IDE at the time (`server.py`, `common.py`,
+  `client.py`) rather than answered from memory of what was written earlier in the session, catching that
+  line numbers had shifted since Entry 12's edits.
+- `[student to fill in]`: this back-and-forth is exactly the kind of "explain your own socket calls"
+  competency the Theoretical Understanding rubric grades — record here whether these explanations were
+  independently verified/reproduced, not just read and accepted.
+
+---
+
+## Entry 14 — Technical report, diagrams, and demo evidence analysis
+
+**Prompt used:**
+> Assignment không chỉ chấm code. Section 2.4 yêu cầu Technical Report gồm 7 phần, hiện chỉ có phần 6
+> (GenAI log) là đang được duy trì: [list of 7 sections, items 1–5 and 7 marked missing] ... do it in
+> folder docs create code mermaid for sequence diagram and write latex for technical report
+> '.../testing_evidence' i have testing evident where file of rudp is complete and udp is missing
+
+**Raw GenAI output (summary of actions taken):**
+The AI inspected `testing_evidence/` (two PNGs the student had already produced from a real `put`/`get`
+demo: `heavy_pic_rudp.png`, `heavy_pic_udp.png`) rather than taking the student's description at face
+value, and derived concrete facts from the bytes themselves: both files share the same declared
+2816×1536 dimensions and a valid PNG `IEND` trailer, but the `udp` file is exactly 1,203,200 bytes shorter;
+the two files are byte-identical up to offset 3,399,680, and both that offset and the missing byte count
+are exact multiples of `CHUNK_SIZE` (1024) — i.e. 1175 whole UDP datagrams were lost, not partial-packet
+corruption. Confirmed pdflatex/mermaid-cli were available locally, then produced:
+- `docs/diagrams.md` — 6 Mermaid diagrams (2 sequence diagrams: full TCP+UDP lifecycle including a
+  simulated GBN retransmission, and Active/Passive negotiation; 4 flowcharts: server thread-dispatch, GBN
+  sender state machine, GBN receiver state machine, client mode selection).
+- `docs/render_diagrams.sh` — extracts each mermaid block and renders it to PNG via
+  `npx @mermaid-js/mermaid-cli`, so the diagrams can be regenerated after any future code change instead
+  of going stale.
+- `docs/technical_report.tex` — a full LaTeX report covering all 7 mandatory sections: Sections 1–3
+  (scenario/diagrams, data structures, flowcharts) filled in from the actual codebase; Section 7 (demo
+  evidence) built around the byte-level RUDP-vs-UDP analysis above, with both evidence images embedded
+  (recompressed from ~17MB combined to ~250KB); Sections 4–5 (Task Assignment Matrix, Self-Assessment &
+  Peer Evaluation) left as clearly marked `% TODO(team)` placeholder tables, since those require real
+  team/individual input the AI does not have; Section 6 explicitly notes that this Excellent Level GenAI
+  log entry (Entry 12 above) was pending at time of writing.
+
+**Refinement & problem solving:**
+- **Did not claim the diagrams or report compiled without checking.** Rendered all 6 mermaid diagrams and
+  hit one real syntax error (a semicolon inside a sequence-diagram message body — `"200 PORT command
+  successful; server data port N."` — being misparsed as a mermaid statement separator); fixed and
+  re-rendered. Compiled the LaTeX twice with `pdflatex -halt-on-error`, hit a fatal `\square` undefined
+  (missing `amssymb` package) and two "float too large for page" warnings on the taller diagrams, fixed
+  both (added the package; added `height=...,keepaspectratio` to every `\includegraphics`), and only
+  reported success once a clean recompile produced zero warnings.
+- **Rendered specific PDF pages back to images with Ghostscript to visually verify layout** (title/TOC
+  page, the sequence-diagram page, the demo-evidence page with the embedded photos) rather than trusting
+  "pdflatex exited 0" as sufficient — this caught nothing further wrong, but was how the earlier float and
+  package errors would have been caught if they'd been purely cosmetic instead of fatal/warned.
+- **Explicitly refused to fabricate what it didn't have**: the Task Assignment Matrix and Self-Assessment
+  sections were left as visibly incomplete placeholder tables rather than invented plausible-looking
+  content, since Section 4.1 of the spec ties individual grades to this matrix and fabricating it would be
+  actively misleading, not just unhelpful.
+- `[student to fill in]`: verify the byte-offset/chunk-count analysis in Section 7.1 by re-deriving it
+  independently (e.g. `cmp` or a short Python diff of the two evidence PNGs) before presenting it as your
+  own finding in the oral defense — it was computed once, by the AI, and not independently cross-checked
+  by a second method.
+
+---

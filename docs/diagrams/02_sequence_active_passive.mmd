@@ -1,0 +1,21 @@
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    rect rgb(235, 245, 255)
+    Note over C,S: PASSIVE — server opens the socket, client connects to it
+    C->>S: PASV
+    S->>S: handle_pasv(): bind new ephemeral UDP socket
+    S-->>C: 227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)
+    C->>S: PKT_HELLO (UDP, to server's announced port)
+    Note right of S: client_data_addr learned from HELLO
+    end
+
+    rect rgb(255, 245, 235)
+    Note over C,S: ACTIVE — client opens the socket, tells server its address
+    C->>S: PORT h1,h2,h3,h4,p1,p2
+    S->>S: handle_port(): bind new ephemeral UDP socket
+    Note right of S: client_data_addr known immediately<br/>from the PORT argument — no HELLO needed
+    S-->>C: 200 PORT command successful - server data port N.
+    Note left of C: deliberate RFC 959 deviation — UDP has no<br/>server-initiated connect(), so the client needs<br/>the server's port for its own uploads (STOR)
+    end

@@ -1,0 +1,15 @@
+flowchart TD
+    A["expected_seq = 0, chunks = []"] --> B["recvfrom() with timeout = rto"]
+    B -->|timeout| C["idle += 1"]
+    C --> D{"idle > max_retries?"}
+    D -- yes --> Y[return None]
+    D -- no --> B
+    B -->|packet from expected_addr| E{"valid checksum AND<br/>seq == expected_seq?"}
+    E -- yes --> F{"pkt_type?"}
+    F -- PKT_DATA --> G["chunks.append(payload)<br/>send PKT_ACK(expected_seq)<br/>expected_seq += 1"]
+    G --> B
+    F -- PKT_FIN --> H["send PKT_ACK(expected_seq)<br/>return join(chunks)"]
+    E -- no --> I{"expected_seq > 0?"}
+    I -- yes --> J["Re-send PKT_ACK(expected_seq - 1)<br/>(corrupt / out-of-order / duplicate retransmit)"]
+    J --> B
+    I -- no --> B
