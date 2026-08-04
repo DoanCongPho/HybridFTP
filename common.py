@@ -1,5 +1,6 @@
 """Shared constants and helpers for the Hybrid FTP control (TCP) and data (UDP) channels."""
 
+import hashlib
 import re
 import socket
 import struct
@@ -61,7 +62,16 @@ def drain_stale_packets(sock):
 
     FIXED mode reuses one UDP socket for an entire session (or, server-side,
     the whole server lifetime) rather than opening a fresh one per transfer.
-    Call this right before a receive loop starts to guarantee a clean slate."""
+    Packet `seq` numbers reset to 0 for every new STOR/RETR/LIST/etc — there
+    is no other field identifying which logical transfer a packet belongs
+    to. Over a real network, a straggler packet from a *previous* transfer
+    (e.g. one the receiver already gave up on after a timeout, but the
+    sender fired anyway with no ACK to know better) can still be in flight
+    or unread in the OS socket buffer when the *next* command starts — and
+    gets misread as belonging to the new transfer, silently corrupting it
+    with leftover data from the old one. Call this right before a receive
+    loop starts (both gbn_receive() and the best-effort paths in
+    server.py/client.py) to guarantee a clean slate."""
     sock.settimeout(0)
     try:
         while True:
@@ -224,6 +234,13 @@ def ascii_mask(data):
     return bytes(b & 0x7F for b in data)
 
 
+def compute_hash(data, algorithm="sha256"):
+    """SHA-256 (default) or MD5 hex digest of `data` — the Excellent Level
+    end-to-end integrity check shared by HASH (server) and the client's
+    optional post-transfer verification."""
+    return hashlib.new(algorithm, data).hexdigest()
+
+
 # --- PORT/PASV address encoding (Advanced Level: Active/Passive mode) --------
 # Same "h1,h2,h3,h4,p1,p2" encoding RFC 959 uses for the PORT command and the
 # PASV reply's parenthesized address, shared here since both client and
@@ -283,17 +300,17 @@ class Reply:
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
     HELP_TEXT = ("214 Commands: USER PASS QUIT NOOP PWD CWD CDUP MKD RMD LIST NLST STAT "
-                 "SIZE MDTM TYPE MODE PORT PASV STOR RETR HELP")
-    MODE_NOT_IMPLEMENTED = "502 Command not implemented (Advanced Level supports MODE S only)."
+                 "SIZE MDTM TYPE MODE PORT PASV STOR RETR HASH HELP")
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
     CANT_OPEN_DATA_CONN = "425 Can't open data connection."
     FILE_UNAVAILABLE = "550 File unavailable."
-    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (supported: TYPE A, TYPE I)."
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."
     SYNTAX_ERROR_PARAMS = "501 Syntax error in parameters."
     NOT_IMPLEMENTED = "502 Command not implemented."
+    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (supported: TYPE A, TYPE I)."
+    MODE_NOT_IMPLEMENTED = "502 Command not implemented (Advanced Level supports MODE S only)."
     GOODBYE = "221 Goodbye."
 
     @staticmethod

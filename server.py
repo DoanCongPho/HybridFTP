@@ -1,8 +1,8 @@
 """Hybrid FTP server — Basic + Advanced Level.
 
 Control channel: TCP, fixed port (see common.CONTROL_PORT).
-Data channel:    UDP, fixed port (see common.DATA_PORT) — Basic Level's one
-                  fixed data-channel connection mechanism.
+Data channel:    UDP, fixed port (see common.DATA_PORT) for FIXED mode, or a
+                  per-session ephemeral UDP socket for ACTIVE/PASSIVE mode.
 
 Basic Level (always on): USER/PASS auth, ASCII upload/download of a single
 file, one fixed data-channel mechanism, single-threaded by default.
@@ -10,11 +10,8 @@ file, one fixed data-channel mechanism, single-threaded by default.
 Advanced Level (opt-in via config.ini, see config.py): binary transfer
 (TYPE I), a real directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM),
 Active/Passive data-mode switching (PORT/PASV), and a multi-threaded server
-with an active-session table.
-
-Excellent Level (opt-in): a custom Go-Back-N reliable-UDP layer
-([reliability] mode=gbn in common.py) as an alternative to the best-effort
-UDP framing above.
+with an active-session table. See README.md for the full command list and
+what is still deliberately not implemented (Excellent Level scope).
 """
 
 import functools
@@ -31,7 +28,7 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_port_arg, recv_line, send_line,
-    gbn_send, gbn_receive, drain_stale_packets, ascii_mask,
+    gbn_send, gbn_receive, compute_hash, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -41,12 +38,13 @@ if os.path.isabs(_storage_root_cfg):
 else:
     STORAGE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), _storage_root_cfg)
 
+THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single | thread
 ADVERTISE_IP = CONFIG.get("server", "advertise_ip", fallback="").strip()
 
 # Port range for per-session ACTIVE/PASSIVE UDP sockets. Blank (the default)
 # means "let the OS pick any free ephemeral port" — fine on a LAN/loopback,
-# but behind a cloud NSG/firewall that only opens a couple of fixed ports, a
-# random port gets silently dropped before it reaches this process. Setting
+# but behind a cloud NSG/firewall that only opens a couple of fixed ports,
+# a random port gets silently dropped before it reaches this process. Setting
 # both bounds restricts binding to that range so only it needs to be opened
 # on the firewall once (mirrors vsftpd's pasv_min_port/pasv_max_port).
 _pasv_min_raw = CONFIG.get("server", "passive_port_min", fallback="").strip()
@@ -54,8 +52,6 @@ _pasv_max_raw = CONFIG.get("server", "passive_port_max", fallback="").strip()
 PASSIVE_PORT_RANGE = (
     (int(_pasv_min_raw), int(_pasv_max_raw)) if _pasv_min_raw and _pasv_max_raw else None
 )
-
-THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single | thread
 
 # Excellent Level: Go-Back-N reliable-UDP layer. "none" (default) preserves
 # the exact best-effort framing above; both server and client must agree on
@@ -65,10 +61,21 @@ GBN_WINDOW_SIZE = CONFIG.getint("reliability", "window_size", fallback=4)
 GBN_RTO = CONFIG.getint("reliability", "rto_ms", fallback=300) / 1000.0
 GBN_MAX_RETRIES = CONFIG.getint("reliability", "max_retries", fallback=30)
 
+HASH_ALGORITHM = CONFIG.get("integrity", "algorithm", fallback="sha256").strip().lower()
+if HASH_ALGORITHM not in ("sha256", "md5"):
+    HASH_ALGORITHM = "sha256"
+
 USERS = {
     "alice": "password123",
     "bob": "hunter2",
 }
+
+# Commands defined by the spec but still not implemented (Excellent Level
+# scope: append/rename/unique-store features not needed to demonstrate RDT,
+# congestion control, or integrity verification). Listed explicitly so the
+# dispatcher has a named slot for each rather than falling through to a
+# generic "unknown command".
+NOT_IMPLEMENTED = {"STOU", "APPE", "DELE", "RNFR", "RNTO", "ABOR"}
 
 _session_id_lock = threading.Lock()
 _session_id_counter = itertools.count(1)
@@ -143,8 +150,10 @@ class Session:
         self.cwd = "/"
 
         # Data-channel state. FIXED mode (Basic Level default) reuses the
-        # one shared, server-wide UDP socket bound at DATA_PORT — see
-        # resolve_data_endpoint() below.
+        # one shared, server-wide UDP socket bound at DATA_PORT; ACTIVE and
+        # PASSIVE (Advanced Level) each get a dedicated per-session ephemeral
+        # socket so concurrent sessions don't collide — see
+        # resolve_data_endpoint() and handle_port()/handle_pasv() below.
         self.data_mode = DataMode.FIXED
         self.data_sock = fixed_udp_sock
         self.owns_data_sock = False
@@ -200,7 +209,9 @@ def handle_stor(session, filename):
         send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
         return
     # Drain BEFORE telling the client to start sending (FILE_STATUS_OK) — the
-    # client could start firing data the instant it sees "150".
+    # client could start firing data the instant it sees "150", so draining
+    # any later point risks discarding this transfer's own first packets on
+    # a fast/local network. See common.gbn_receive()'s docstring.
     drain_stale_packets(sock)
     send_line(session.conn, Reply.FILE_STATUS_OK)
 
@@ -220,6 +231,9 @@ def handle_stor(session, filename):
             while True:
                 raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
                 if addr != expected_addr:
+                    # Stray traffic (scan noise, or — under concurrency —
+                    # another session sharing this socket in FIXED mode);
+                    # not this transfer's data, ignore and keep waiting.
                     continue
                 pkt_type, seq, payload, valid = parse_packet(raw)
                 if not valid:
@@ -364,6 +378,20 @@ def handle_mdtm(session, arg):
     send_line(session.conn, f"213 {ts}")
 
 
+def handle_hash(session, arg):
+    """Excellent Level: end-to-end integrity verification."""
+    if not arg:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    _, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.isfile(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    with open(fs_path, "rb") as f:
+        data = f.read()
+    send_line(session.conn, f"213 {HASH_ALGORITHM} {compute_hash(data, HASH_ALGORITHM)}")
+
+
 def _bind_session_data_socket(session):
     """Open a fresh UDP socket for a per-session (ACTIVE/PASSIVE) data
     channel, bound either to an OS-assigned ephemeral port (default) or to
@@ -389,7 +417,8 @@ def handle_pasv(session):
     """PASV: open a fresh per-session UDP socket, tell the client where it
     lives, then wait for the client's HELLO on it to learn the client's
     address — the same handshake FIXED mode uses, just on a private port
-    instead of the shared DATA_PORT."""
+    instead of the shared DATA_PORT, which is what gives concurrent sessions
+    isolated data channels."""
     session.close_data_socket()
     sock = _bind_session_data_socket(session)
     if sock is None:
@@ -460,11 +489,20 @@ def handle_client(conn, addr, fixed_udp_sock):
     # Idle timeout on the control channel: if a client dies without ever
     # sending FIN/RST (power loss, network drop, VM freeze — not just a
     # killed process, which the OS still closes cleanly), recv() would
-    # otherwise block here forever. NOOP exists to renew this timer.
+    # otherwise block here forever. In single-threaded mode that would
+    # freeze the server for every other client; in threaded mode it would
+    # merely leak one thread — either way NOOP exists to renew this timer.
     conn.settimeout(CONTROL_IDLE_TIMEOUT)
     try:
         send_line(conn, Reply.SERVICE_READY)
         while True:
+            # Every read AND every reply for this command lives inside one
+            # try/except: if the client vanishes mid-command (process
+            # killed, network drop) instead of sending QUIT, recv/send will
+            # raise a connection-level error here. We treat that exactly
+            # like a normal disconnect — log it and fall through to
+            # cleanup_session() in the outer finally — rather than letting
+            # it propagate as an unhandled crash.
             try:
                 line = recv_line(conn)
                 if line is None:
@@ -491,9 +529,9 @@ def handle_client(conn, addr, fixed_udp_sock):
                         session.authenticated = True
                         send_line(conn, Reply.LOGIN_SUCCESS)
                         # Fixed data-channel handshake: wait for the client's
-                        # HELLO datagram so we learn its UDP address. This is
-                        # what makes FIXED a genuine "connection" instead of
-                        # just a well-known port nobody ever addresses.
+                        # HELLO datagram so we learn its UDP address. Only
+                        # relevant if the session stays in FIXED mode; a
+                        # later PORT/PASV will overwrite client_data_addr.
                         session.data_sock.settimeout(SOCK_TIMEOUT)
                         try:
                             raw, caddr = session.data_sock.recvfrom(1024)
@@ -554,12 +592,35 @@ def handle_client(conn, addr, fixed_udp_sock):
                 elif cmd == "MDTM":
                     handle_mdtm(session, arg)
 
+                elif cmd == "HASH":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_hash(session, arg)
+
+                elif cmd == "TYPE":
+                    mode = arg.upper()
+                    if mode in ("A", "I"):
+                        session.type_mode = mode
+                        send_line(conn, Reply.COMMAND_OK)
+                    else:
+                        send_line(conn, Reply.TYPE_NOT_IMPLEMENTED)
+
+                elif cmd == "MODE":
+                    if arg.upper() == "S":
+                        send_line(conn, Reply.COMMAND_OK)
+                    else:
+                        send_line(conn, Reply.MODE_NOT_IMPLEMENTED)
+
                 elif cmd == "SIZE":
                     fs_path = safe_path(session, arg) if arg else None
                     if fs_path and os.path.isfile(fs_path):
                         send_line(conn, Reply.size(os.path.getsize(fs_path)))
                     else:
                         send_line(conn, Reply.FILE_UNAVAILABLE)
+
+                elif cmd == "HELP":
+                    send_line(conn, Reply.HELP_TEXT)
 
                 elif cmd == "PORT":
                     if not session.authenticated:
@@ -587,26 +648,12 @@ def handle_client(conn, addr, fixed_udp_sock):
                     else:
                         handle_retr(session, arg)
 
-                elif cmd == "TYPE":
-                    mode = arg.upper()
-                    if mode in ("A", "I"):
-                        session.type_mode = mode
-                        send_line(conn, Reply.COMMAND_OK)
-                    else:
-                        send_line(conn, Reply.TYPE_NOT_IMPLEMENTED)
-
-                elif cmd == "MODE":
-                    if arg.upper() == "S":
-                        send_line(conn, Reply.COMMAND_OK)
-                    else:
-                        send_line(conn, Reply.MODE_NOT_IMPLEMENTED)
-
-                elif cmd == "HELP":
-                    send_line(conn, Reply.HELP_TEXT)
-
                 elif cmd == "QUIT":
                     send_line(conn, Reply.GOODBYE)
                     break
+
+                elif cmd in NOT_IMPLEMENTED:
+                    send_line(conn, Reply.NOT_IMPLEMENTED)
 
                 else:
                     send_line(conn, Reply.SYNTAX_ERROR_CMD)

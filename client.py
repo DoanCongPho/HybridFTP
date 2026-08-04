@@ -4,7 +4,7 @@ Usage:
     python3 client.py <server_host>
 
 Commands:
-    user <name>
+    user <name>                        PASS <name>
     pass <password>
     put <local_file> [remote_name]     upload (STOR)
     get <remote_name> [local_file]     download (RETR)
@@ -20,6 +20,7 @@ Commands:
     active                             switch to Active mode (PORT)
     passive                            switch to Passive mode (PASV)
     fixed                              switch back to Basic Level fixed mode
+    hash <filename>                    server-side MD5/SHA-256 of a file
     pwd
     size <filename>
     noop
@@ -29,15 +30,15 @@ Commands:
 
 import os
 import re
-import socket
 import sys
+import socket
 import time
 
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
-    gbn_send, gbn_receive, drain_stale_packets, ascii_mask,
+    gbn_send, gbn_receive, compute_hash, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -56,12 +57,21 @@ GBN_WINDOW_SIZE = CONFIG.getint("reliability", "window_size", fallback=4)
 GBN_RTO = CONFIG.getint("reliability", "rto_ms", fallback=300) / 1000.0
 GBN_MAX_RETRIES = CONFIG.getint("reliability", "max_retries", fallback=30)
 
+# Excellent Level: end-to-end MD5/SHA-256 hash verification.
+VERIFY_HASH = CONFIG.getboolean("integrity", "verify", fallback=False)
+HASH_ALGORITHM = CONFIG.get("integrity", "algorithm", fallback="sha256").strip().lower()
+if HASH_ALGORITHM not in ("sha256", "md5"):
+    HASH_ALGORITHM = "sha256"
+
 
 class FTPClient:
     def __init__(self, host, control_port=CONTROL_PORT, data_port=DATA_PORT):
-        # Resolve to a numeric IP once, up front — recvfrom() always hands
-        # back a resolved numeric IP, so keeping `host` as a hostname would
-        # make later address comparisons never match.
+        # Resolve to a numeric IP once, up front. gbn_send() matches incoming
+        # ACKs against this same tuple via `addr == dest_addr`, and
+        # recvfrom() always hands back a resolved numeric IP — so if `host`
+        # were kept as a hostname (e.g. "localhost"), that comparison would
+        # never match, every real ACK would be silently dropped, and a
+        # transfer would look like 100% packet loss until max_retries gives up.
         self.host = socket.gethostbyname(host)
         self.data_port = data_port
         self.authenticated = False
@@ -70,7 +80,7 @@ class FTPClient:
         # the server's well-known DATA_PORT). ACTIVE/PASSIVE are negotiated
         # live via PORT/PASV — see set_active()/set_passive()/set_fixed().
         self.data_mode = _MODE_MAP.get(_DEFAULT_DATA_MODE, DataMode.FIXED)
-        self.type_mode = "A"   # RFC 959 default
+        self.type_mode = "A"   # RFC 959 default; kept in sync with the server via TYPE's 200 reply
         self.active_server_port = None   # learned from the server's PORT reply
         self.passive_target = None       # learned from the server's PASV reply
 
@@ -147,7 +157,11 @@ class FTPClient:
     def login(self, username, password):
         """Send PASS and, on success, establish the data channel using
         whichever mode is currently selected (config default, or a prior
-        `active`/`passive` REPL command)."""
+        `active`/`passive` REPL command).
+
+        Assumes USER has already been sent for `username` (the REPL sends it
+        as soon as the user types `user <name>`, before `pass` is typed).
+        """
         reply = self.command(f"PASS {password}")
         print(reply)
         if reply.startswith("230"):
@@ -165,10 +179,13 @@ class FTPClient:
         """Receive one data-channel transfer (PKT_DATA... PKT_FIN) and
         reassemble it in sequence order — reliably via Go-Back-N if
         [reliability] mode=gbn, otherwise the original best-effort framing.
+        Used by both get() (saved to a file) and list_dir() (printed to
+        stdout) — RETR/LIST/NLST all use the same UDP framing server-side.
+
         Callers must drain_stale_packets() themselves *before* sending the
-        RETR request — the server may start sending the instant it sees our
-        request, so draining at this point risks discarding this transfer's
-        own first packets."""
+        RETR/LIST/NLST request (not here) — the server may start sending the
+        instant it sees our request, so draining at this point risks
+        discarding this transfer's own first packets on a fast/local network."""
         if RELIABILITY_MODE == "gbn":
             target = self._data_target()
 
@@ -209,6 +226,10 @@ class FTPClient:
             return
         with open(local_path, "rb") as f:
             data = f.read()
+        # TYPE A masks a throwaway copy for the wire only — `data` (the true
+        # local bytes) is what gets hash-verified below, so a binary file
+        # sent under ASCII mode correctly reports a MISMATCH instead of
+        # comparing the corrupted copy against itself.
         wire_data = ascii_mask(data) if self.type_mode == "A" else data
         target = self._data_target()
         if RELIABILITY_MODE == "gbn":
@@ -227,13 +248,15 @@ class FTPClient:
                 seq += 1
             self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
         print(self._read_reply())
+        if VERIFY_HASH:
+            self._verify_hash(remote_name, data)
 
     def get(self, remote_name, local_path=None):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         local_path = local_path or os.path.join(DOWNLOAD_DIR, remote_name)
         # Drain BEFORE asking — once the server sees RETR it may start
         # sending immediately, so draining any later risks discarding this
-        # transfer's own first packets.
+        # transfer's own first packets on a fast/local network.
         drain_stale_packets(self.udp_sock)
         reply = self.command(f"RETR {remote_name}")
         print(reply)
@@ -241,12 +264,42 @@ class FTPClient:
             return
         data = self._recv_data_payload()
         if data is None:
+            # The server still sends a final control-channel reply
+            # regardless of whether our UDP receive succeeded (unconditionally
+            # in best-effort mode; 426 once its own retry budget is exhausted
+            # in GBN mode) — read and discard it now, or it gets misread as
+            # the reply to whatever command runs next, desyncing the session.
             print(self._read_reply())
             return
         with open(local_path, "wb") as f:
             f.write(data)
         print(f"[+] Saved to {local_path} ({len(data)} bytes)")
         print(self._read_reply())
+        if VERIFY_HASH:
+            self._verify_hash(remote_name, data)
+
+    def hash_remote(self, remote_name):
+        """`hash` REPL command — always works standalone regardless of the
+        [integrity] verify config, unlike _verify_hash() which is only the
+        automatic post-transfer check."""
+        return self.command(f"HASH {remote_name}")
+
+    def _verify_hash(self, remote_name, local_data):
+        """Excellent Level: compare a locally-known hash against the
+        server's HASH reply for the same file — used right after put() (we
+        already have the bytes we just sent) and get() (the bytes we just
+        saved)."""
+        local_hash = compute_hash(local_data, HASH_ALGORITHM)
+        reply = self.hash_remote(remote_name)
+        m = re.match(r"213 (\S+) ([0-9a-fA-F]+)", reply)
+        if not m or m.group(1).lower() != HASH_ALGORITHM:
+            print(f"[!] Could not verify integrity: unexpected HASH reply {reply!r}")
+            return
+        if m.group(2).lower() == local_hash.lower():
+            print(f"[+] Integrity verified ({HASH_ALGORITHM}): MATCH ({local_hash})")
+        else:
+            print(f"[!] INTEGRITY CHECK FAILED ({HASH_ALGORITHM}): "
+                  f"local={local_hash} server={m.group(2)}")
 
     def list_dir(self, path="", name_only=False):
         cmd = "NLST" if name_only else "LIST"
@@ -342,6 +395,11 @@ def repl(host):
                 client.set_passive()
             elif cmd == "fixed":
                 client.set_fixed()
+            elif cmd == "hash":
+                if not arg:
+                    print("Usage: hash <filename>")
+                    continue
+                print(client.hash_remote(arg))
             elif cmd == "pwd":
                 print(client.command("PWD"))
             elif cmd == "size":
