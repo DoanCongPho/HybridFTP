@@ -1,0 +1,12 @@
+flowchart TD
+    A[main: bind TCP 2121 + UDP 2122] --> B{tcp_sock.accept}
+    B --> C[New connection: conn, addr]
+    C --> D{config threading == 'thread'?}
+    D -- yes --> E["threading.Thread(target=serve, daemon=True).start()"]
+    D -- no --> F["serve(conn, addr) — synchronous, blocks accept loop"]
+    E --> G[handle_client in its own thread]
+    F --> G
+    G --> H[Session created, registered in _active_sessions]
+    H --> I["while True: recv_line(conn) → dispatch command"]
+    I -->|QUIT / EOF / timeout / error| J[cleanup_session: close sockets, unregister]
+    J --> B

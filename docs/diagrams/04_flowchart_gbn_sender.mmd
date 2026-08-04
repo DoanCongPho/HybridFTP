@@ -1,0 +1,16 @@
+flowchart TD
+    A[Frame data into PKT_DATA 0..N-1 + PKT_FIN N] --> B["base=0, next_seq=0"]
+    B --> C["send_window(): sendto up to window_size packets"]
+    C --> D{"base < total?"}
+    D -- no --> Z["return True (FIN acknowledged)"]
+    D -- yes --> E["recvfrom() with timeout = rto"]
+    E -->|PKT_ACK ack_seq, from dest_addr| F{"ack_seq >= base?"}
+    F -- yes --> G["base = ack_seq + 1; retries = 0"]
+    G --> H[send_window: fill window with any newly-eligible packets]
+    H --> D
+    F -- no --> E
+    E -->|socket.timeout| I["retries += 1"]
+    I --> J{"retries > max_retries?"}
+    J -- yes --> Y["return False (peer presumed gone)"]
+    J -- no --> K["Resend ALL packets base..next_seq-1<br/>(whole window — Go-Back-N, not Selective Repeat)"]
+    K --> D

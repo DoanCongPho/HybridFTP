@@ -1,0 +1,9 @@
+flowchart TD
+    A["login(): PASS accepted (230)"] --> B{"self.data_mode"}
+    B -- FIXED --> C["Send PKT_HELLO to (host, DATA_PORT)"]
+    B -- ACTIVE --> D["set_active(): send PORT with own ip:port<br/>parse server's port from 200 reply"]
+    B -- PASSIVE --> E["set_passive(): send PASV<br/>parse 227 reply, HELLO that address"]
+    C --> F[Ready for put/get]
+    D --> F
+    E --> F
+    F --> G["REPL: active / passive / fixed<br/>can still switch mode live, mid-session"]
