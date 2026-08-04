@@ -66,7 +66,13 @@ if HASH_ALGORITHM not in ("sha256", "md5"):
 
 class FTPClient:
     def __init__(self, host, control_port=CONTROL_PORT, data_port=DATA_PORT):
-        self.host = host
+        # Resolve to a numeric IP once, up front. gbn_send() matches incoming
+        # ACKs against this same tuple via `addr == dest_addr`, and
+        # recvfrom() always hands back a resolved numeric IP — so if `host`
+        # were kept as a hostname (e.g. "localhost"), that comparison would
+        # never match, every real ACK would be silently dropped, and a
+        # transfer would look like 100% packet loss until max_retries gives up.
+        self.host = socket.gethostbyname(host)
         self.data_port = data_port
         self.authenticated = False
 
