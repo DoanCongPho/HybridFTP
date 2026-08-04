@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+.DS_Store
+
+# LaTeX build artifacts (docs/technical_report.tex is the source of truth)
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
