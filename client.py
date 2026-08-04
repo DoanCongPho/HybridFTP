@@ -17,7 +17,9 @@ Commands:
     stat [path]                        server/session or path status
     mdtm <filename>                    last-modified timestamp
     type {A|I}                         ASCII or binary transfer type
-    fixed                              (re-)announce our address on the fixed data channel
+    active                             switch to Active mode (PORT)
+    passive                            switch to Passive mode (PASV)
+    fixed                              switch back to Basic Level fixed mode
     pwd
     size <filename>
     noop
@@ -32,14 +34,19 @@ import sys
 import time
 
 from common import (
-    CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, PKT_HELLO, PKT_DATA, PKT_FIN,
-    make_packet, parse_packet, recv_line, send_line, drain_stale_packets, ascii_mask,
+    CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
+    PKT_HELLO, PKT_DATA, PKT_FIN,
+    make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
+    drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
 DOWNLOAD_DIR_CFG = CONFIG.get("client", "download_dir", fallback="client_downloads")
 DOWNLOAD_DIR = (DOWNLOAD_DIR_CFG if os.path.isabs(DOWNLOAD_DIR_CFG)
                  else os.path.join(os.path.dirname(os.path.abspath(__file__)), DOWNLOAD_DIR_CFG))
+
+_DEFAULT_DATA_MODE = CONFIG.get("client", "data_mode", fallback="fixed").strip().lower()
+_MODE_MAP = {"fixed": DataMode.FIXED, "active": DataMode.ACTIVE, "passive": DataMode.PASSIVE}
 
 
 class FTPClient:
@@ -50,7 +57,14 @@ class FTPClient:
         self.host = socket.gethostbyname(host)
         self.data_port = data_port
         self.authenticated = False
+
+        # Data-channel mode. FIXED reproduces Basic Level exactly (HELLO to
+        # the server's well-known DATA_PORT). ACTIVE/PASSIVE are negotiated
+        # live via PORT/PASV — see set_active()/set_passive()/set_fixed().
+        self.data_mode = _MODE_MAP.get(_DEFAULT_DATA_MODE, DataMode.FIXED)
         self.type_mode = "A"   # RFC 959 default
+        self.active_server_port = None   # learned from the server's PORT reply
+        self.passive_target = None       # learned from the server's PASV reply
 
         self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.conn.connect((host, control_port))
@@ -70,19 +84,73 @@ class FTPClient:
         send_line(self.conn, text)
         return self._read_reply()
 
+    def _data_target(self):
+        if self.data_mode == DataMode.FIXED:
+            return (self.host, self.data_port)
+        if self.data_mode == DataMode.ACTIVE:
+            return (self.host, self.active_server_port)
+        if self.data_mode == DataMode.PASSIVE:
+            return self.passive_target
+        raise NotImplementedError(f"data mode {self.data_mode!r} not implemented")
+
     def set_fixed(self):
-        """Basic Level's fixed data-channel mechanism: HELLO the server's
-        well-known UDP port so it learns our address."""
+        """Switch back to Basic Level's fixed data-channel mechanism."""
+        self.data_mode = DataMode.FIXED
         self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), (self.host, self.data_port))
         print(f"[*] Data mode: FIXED ({self.host}:{self.data_port})")
 
+    def set_active(self):
+        """Advanced Level: tell the server our address via PORT; it opens a
+        dedicated per-session socket and reports its port back (needed for
+        the upload direction, since UDP has no server-initiated connect())."""
+        local_ip = self.conn.getsockname()[0]
+        local_port = self.udp_sock.getsockname()[1]
+        reply = self.command(f"PORT {format_port_arg(local_ip, local_port)}")
+        print(reply)
+        if not reply.startswith("200"):
+            return False
+        m = re.search(r"data port (\d+)", reply)
+        if not m:
+            print("[!] Server did not report a data port; staying on the previous mode.")
+            return False
+        self.active_server_port = int(m.group(1))
+        self.data_mode = DataMode.ACTIVE
+        print(f"[*] Data mode: ACTIVE (server will use port {self.active_server_port})")
+        return True
+
+    def set_passive(self):
+        """Advanced Level: ask the server to open a per-session socket via
+        PASV, then HELLO it so it learns our address (same mechanism FIXED
+        mode uses, just on a private port)."""
+        reply = self.command("PASV")
+        print(reply)
+        if not reply.startswith("227"):
+            return False
+        parsed = parse_pasv_reply(reply)
+        if parsed is None:
+            print("[!] Could not parse PASV reply.")
+            return False
+        self.passive_target = parsed
+        self.data_mode = DataMode.PASSIVE
+        self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), self.passive_target)
+        print(f"[*] Data mode: PASSIVE (server at {self.passive_target[0]}:{self.passive_target[1]})")
+        return True
+
     def login(self, username, password):
+        """Send PASS and, on success, establish the data channel using
+        whichever mode is currently selected (config default, or a prior
+        `active`/`passive` REPL command)."""
         reply = self.command(f"PASS {password}")
         print(reply)
         if reply.startswith("230"):
             self.authenticated = True
-            self.udp_sock.sendto(make_packet(PKT_HELLO, 0, username.encode("ascii")),
-                                  (self.host, self.data_port))
+            if self.data_mode == DataMode.ACTIVE:
+                self.set_active()
+            elif self.data_mode == DataMode.PASSIVE:
+                self.set_passive()
+            else:
+                self.udp_sock.sendto(make_packet(PKT_HELLO, 0, username.encode("ascii")),
+                                      (self.host, self.data_port))
         return self.authenticated
 
     def _recv_data_payload(self):
@@ -121,7 +189,7 @@ class FTPClient:
         with open(local_path, "rb") as f:
             data = f.read()
         wire_data = ascii_mask(data) if self.type_mode == "A" else data
-        target = (self.host, self.data_port)
+        target = self._data_target()
         seq = 0
         for i in range(0, len(wire_data), CHUNK_SIZE):
             chunk = wire_data[i:i + CHUNK_SIZE]
@@ -238,6 +306,10 @@ def repl(host):
                 print(reply)
                 if reply.startswith("200"):
                     client.type_mode = mode
+            elif cmd == "active":
+                client.set_active()
+            elif cmd == "passive":
+                client.set_passive()
             elif cmd == "fixed":
                 client.set_fixed()
             elif cmd == "pwd":

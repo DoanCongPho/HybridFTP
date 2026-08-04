@@ -7,9 +7,9 @@ Data channel:    UDP, fixed port (see common.DATA_PORT) — Basic Level's one
 Basic Level (always on): USER/PASS auth, ASCII upload/download of a single
 file, one fixed data-channel mechanism, single-threaded by default.
 
-Advanced Level (opt-in): binary transfer (TYPE I) without corrupting the
-bytes that TYPE A's ascii_mask() would otherwise alter, and a real
-directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM).
+Advanced Level (opt-in via config.ini, see config.py): binary transfer
+(TYPE I), a real directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM), and
+Active/Passive data-mode switching (PORT/PASV).
 """
 
 import functools
@@ -23,7 +23,7 @@ print = functools.partial(print, flush=True)  # keep server log visible even whe
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
-    make_packet, parse_packet, recv_line, send_line, drain_stale_packets, ascii_mask,
+    make_packet, parse_packet, parse_port_arg, recv_line, send_line, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -32,6 +32,20 @@ if os.path.isabs(_storage_root_cfg):
     STORAGE_ROOT = _storage_root_cfg
 else:
     STORAGE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), _storage_root_cfg)
+
+ADVERTISE_IP = CONFIG.get("server", "advertise_ip", fallback="").strip()
+
+# Port range for per-session ACTIVE/PASSIVE UDP sockets. Blank (the default)
+# means "let the OS pick any free ephemeral port" — fine on a LAN/loopback,
+# but behind a cloud NSG/firewall that only opens a couple of fixed ports, a
+# random port gets silently dropped before it reaches this process. Setting
+# both bounds restricts binding to that range so only it needs to be opened
+# on the firewall once (mirrors vsftpd's pasv_min_port/pasv_max_port).
+_pasv_min_raw = CONFIG.get("server", "passive_port_min", fallback="").strip()
+_pasv_max_raw = CONFIG.get("server", "passive_port_max", fallback="").strip()
+PASSIVE_PORT_RANGE = (
+    (int(_pasv_min_raw), int(_pasv_max_raw)) if _pasv_min_raw and _pasv_max_raw else None
+)
 
 USERS = {
     "alice": "password123",
@@ -80,12 +94,20 @@ class Session:
         # resolve_data_endpoint() below.
         self.data_mode = DataMode.FIXED
         self.data_sock = fixed_udp_sock
-        self.client_data_addr = None      # learned from the client's HELLO datagram
+        self.owns_data_sock = False
+        self.client_data_addr = None      # learned from the client's HELLO datagram, or from PORT
 
     def resolve_data_endpoint(self):
         """Single seam for finding out where/how to send or receive file
         data for this session: (socket_to_use, client_address)."""
         return self.data_sock, self.client_data_addr
+
+    def close_data_socket(self):
+        if self.owns_data_sock and self.data_sock is not None:
+            try:
+                self.data_sock.close()
+            except OSError:
+                pass
 
 
 def _send_over_data_channel(session, data):
@@ -271,9 +293,82 @@ def handle_mdtm(session, arg):
     send_line(session.conn, f"213 {ts}")
 
 
+def _bind_session_data_socket(session):
+    """Open a fresh UDP socket for a per-session (ACTIVE/PASSIVE) data
+    channel, bound either to an OS-assigned ephemeral port (default) or to
+    a free port within PASSIVE_PORT_RANGE if configured. Returns None if
+    every port in a configured range is already taken."""
+    ip = session.conn.getsockname()[0]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if PASSIVE_PORT_RANGE is None:
+        sock.bind((ip, 0))
+        return sock
+    lo, hi = PASSIVE_PORT_RANGE
+    for port in range(lo, hi + 1):
+        try:
+            sock.bind((ip, port))
+            return sock
+        except OSError:
+            continue  # port already in use by another concurrent session, try the next one
+    sock.close()
+    return None
+
+
+def handle_pasv(session):
+    """PASV: open a fresh per-session UDP socket, tell the client where it
+    lives, then wait for the client's HELLO on it to learn the client's
+    address — the same handshake FIXED mode uses, just on a private port
+    instead of the shared DATA_PORT."""
+    session.close_data_socket()
+    sock = _bind_session_data_socket(session)
+    if sock is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
+    session.data_sock = sock
+    session.owns_data_sock = True
+    session.data_mode = DataMode.PASSIVE
+    session.client_data_addr = None
+
+    ip = ADVERTISE_IP or sock.getsockname()[0]
+    port = sock.getsockname()[1]
+    send_line(session.conn, Reply.pasv(ip, port))
+
+    sock.settimeout(SOCK_TIMEOUT)
+    try:
+        raw, caddr = sock.recvfrom(1024)
+        pkt_type, _, _, valid = parse_packet(raw)
+        if valid and pkt_type == PKT_HELLO:
+            session.client_data_addr = caddr
+    except socket.timeout:
+        pass
+
+
+def handle_port(session, arg):
+    """PORT: the client already told us its address, so no HELLO wait is
+    needed — but our UDP data channel is connectionless, so (unlike real
+    RFC 959 active mode) we still open our own dedicated per-session socket
+    and report its port back to the client for the upload (STOR) direction;
+    see Reply.port_ok()."""
+    parsed = parse_port_arg(arg)
+    if parsed is None:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    session.close_data_socket()
+    sock = _bind_session_data_socket(session)
+    if sock is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
+    session.data_sock = sock
+    session.owns_data_sock = True
+    session.data_mode = DataMode.ACTIVE
+    session.client_data_addr = parsed
+    send_line(session.conn, Reply.port_ok(sock.getsockname()[1]))
+
+
 def cleanup_session(session):
     """Always run when a session ends — clean QUIT, abrupt disconnect, or an
     unhandled error — so sockets are closed and state doesn't linger."""
+    session.close_data_socket()
     try:
         session.conn.close()
     except OSError:
@@ -386,6 +481,18 @@ def handle_client(conn, addr, fixed_udp_sock):
                         send_line(conn, Reply.size(os.path.getsize(fs_path)))
                     else:
                         send_line(conn, Reply.FILE_UNAVAILABLE)
+
+                elif cmd == "PORT":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_port(session, arg)
+
+                elif cmd == "PASV":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_pasv(session)
 
                 elif cmd == "STOR":
                     if not session.authenticated:
