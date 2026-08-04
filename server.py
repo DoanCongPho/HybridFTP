@@ -8,14 +8,17 @@ Basic Level (always on): USER/PASS auth, ASCII upload/download of a single
 file, one fixed data-channel mechanism, single-threaded by default.
 
 Advanced Level (opt-in via config.ini, see config.py): binary transfer
-(TYPE I), a real directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM), and
-Active/Passive data-mode switching (PORT/PASV).
+(TYPE I), a real directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM),
+Active/Passive data-mode switching (PORT/PASV), and a multi-threaded server
+with an active-session table.
 """
 
 import functools
+import itertools
 import os
 import posixpath
 import socket
+import threading
 import time
 
 print = functools.partial(print, flush=True)  # keep server log visible even when output is redirected
@@ -47,10 +50,46 @@ PASSIVE_PORT_RANGE = (
     (int(_pasv_min_raw), int(_pasv_max_raw)) if _pasv_min_raw and _pasv_max_raw else None
 )
 
+THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single | thread
+
 USERS = {
     "alice": "password123",
     "bob": "hunter2",
 }
+
+_session_id_lock = threading.Lock()
+_session_id_counter = itertools.count(1)
+
+_session_table_lock = threading.Lock()
+_active_sessions = {}
+
+
+def _next_session_id():
+    with _session_id_lock:
+        return next(_session_id_counter)
+
+
+def _register_session(session):
+    with _session_table_lock:
+        _active_sessions[session.id] = session
+    _print_session_table()
+
+
+def _unregister_session(session):
+    with _session_table_lock:
+        _active_sessions.pop(session.id, None)
+    _print_session_table()
+
+
+def _print_session_table():
+    with _session_table_lock:
+        rows = sorted(_active_sessions.values(), key=lambda s: s.id)
+    print("[*] Active sessions:")
+    if not rows:
+        print("      (none)")
+    for s in rows:
+        print(f"      #{s.id}  {s.addr[0]}:{s.addr[1]}  user={s.username!r}  "
+              f"mode={s.data_mode}  cwd={s.cwd}")
 
 
 def resolve_path(session, arg):
@@ -81,7 +120,8 @@ def safe_path(session, filename):
 
 
 class Session:
-    def __init__(self, conn, addr, fixed_udp_sock):
+    def __init__(self, session_id, conn, addr, fixed_udp_sock):
+        self.id = session_id
         self.conn = conn
         self.addr = addr
         self.username = None
@@ -367,18 +407,25 @@ def handle_port(session, arg):
 
 def cleanup_session(session):
     """Always run when a session ends — clean QUIT, abrupt disconnect, or an
-    unhandled error — so sockets are closed and state doesn't linger."""
+    unhandled error — so sockets are closed and state doesn't linger.
+
+    Guaranteed via try/finally in handle_client(), so a client that
+    disconnects without sending QUIT (crash, Ctrl+C, lost network) is torn
+    down exactly the same way as one that logs out properly.
+    """
     session.close_data_socket()
     try:
         session.conn.close()
     except OSError:
         pass
-    print(f"[*] Session for {session.addr} (user={session.username!r}) closed.")
+    _unregister_session(session)
+    print(f"[*] Session #{session.id} for {session.addr} (user={session.username!r}) closed.")
 
 
 def handle_client(conn, addr, fixed_udp_sock):
-    session = Session(conn, addr, fixed_udp_sock)
-    print(f"[+] Connection from {addr}")
+    session = Session(_next_session_id(), conn, addr, fixed_udp_sock)
+    _register_session(session)
+    print(f"[+] Connection #{session.id} from {addr}")
     # Idle timeout on the control channel: if a client dies without ever
     # sending FIN/RST (power loss, network drop, VM freeze — not just a
     # killed process, which the OS still closes cleanly), recv() would
@@ -424,6 +471,7 @@ def handle_client(conn, addr, fixed_udp_sock):
                                 session.client_data_addr = caddr
                         except socket.timeout:
                             pass
+                        _print_session_table()
                     else:
                         send_line(conn, Reply.NOT_LOGGED_IN)
 
@@ -487,12 +535,14 @@ def handle_client(conn, addr, fixed_udp_sock):
                         send_line(conn, Reply.NOT_LOGGED_IN)
                     else:
                         handle_port(session, arg)
+                        _print_session_table()
 
                 elif cmd == "PASV":
                     if not session.authenticated:
                         send_line(conn, Reply.NOT_LOGGED_IN)
                     else:
                         handle_pasv(session)
+                        _print_session_table()
 
                 elif cmd == "STOR":
                     if not session.authenticated:
@@ -550,14 +600,26 @@ def main():
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcp_sock.bind((host, CONTROL_PORT))
-    tcp_sock.listen(1)
+    tcp_sock.listen(5 if THREADING_MODE == "thread" else 1)
     print(f"[*] Hybrid FTP server listening on TCP {CONTROL_PORT}, UDP data port {DATA_PORT}")
     print(f"[*] Storage root: {STORAGE_ROOT}")
+    print(f"[*] Concurrency mode: {THREADING_MODE}")
+
+    def serve(conn, addr):
+        try:
+            handle_client(conn, addr, udp_sock)
+        except Exception as e:
+            # A single bad session (malformed input, unexpected client
+            # behavior, etc.) must not take the whole server down.
+            print(f"[!] Session with {addr} crashed: {e!r}")
 
     try:
         while True:
             conn, addr = tcp_sock.accept()
-            handle_client(conn, addr, udp_sock)   # single-threaded: one client at a time (Basic Level default)
+            if THREADING_MODE == "thread":
+                threading.Thread(target=serve, args=(conn, addr), daemon=True).start()
+            else:
+                serve(conn, addr)   # single-threaded: one client at a time (Basic Level default)
     except KeyboardInterrupt:
         print("\n[*] Server shutting down.")
     finally:
