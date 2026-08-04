@@ -17,7 +17,7 @@ print = functools.partial(print, flush=True)  # keep server log visible even whe
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
-    make_packet, parse_packet, recv_line, send_line, drain_stale_packets,
+    make_packet, parse_packet, recv_line, send_line, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -50,6 +50,7 @@ class Session:
         self.addr = addr
         self.username = None
         self.authenticated = False
+        self.type_mode = "A"
 
         # Data-channel state. FIXED mode (Basic Level default) reuses the
         # one shared, server-wide UDP socket bound at DATA_PORT — see
@@ -122,9 +123,13 @@ def handle_retr(session, filename):
     send_line(session.conn, Reply.FILE_STATUS_OK)
     with open(fs_path, "rb") as f:
         data = f.read()
+    # TYPE A only affects what goes on the wire, never the file on disk —
+    # mask a throwaway copy, keep `data` (used below for the log line) as
+    # the true byte count of the stored file.
+    wire_data = ascii_mask(data) if session.type_mode == "A" else data
     seq = 0
-    for i in range(0, len(data), CHUNK_SIZE):
-        chunk = data[i:i + CHUNK_SIZE]
+    for i in range(0, len(wire_data), CHUNK_SIZE):
+        chunk = wire_data[i:i + CHUNK_SIZE]
         sock.sendto(make_packet(PKT_DATA, seq, chunk), endpoint)
         seq += 1
     sock.sendto(make_packet(PKT_FIN, seq), endpoint)
@@ -207,6 +212,14 @@ def handle_client(conn, addr, fixed_udp_sock):
                         send_line(conn, Reply.NOT_LOGGED_IN)
                     else:
                         handle_retr(session, arg)
+
+                elif cmd == "TYPE":
+                    mode = arg.upper()
+                    if mode == "A":
+                        session.type_mode = mode
+                        send_line(conn, Reply.COMMAND_OK)
+                    else:
+                        send_line(conn, Reply.TYPE_NOT_IMPLEMENTED)
 
                 elif cmd == "HELP":
                     send_line(conn, Reply.HELP_TEXT)

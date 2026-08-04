@@ -8,6 +8,7 @@ Commands:
     pass <password>
     put <local_file> [remote_name]     upload (STOR)
     get <remote_name> [local_file]     download (RETR)
+    type A                             ASCII transfer type (default)
     fixed                              (re-)announce our address on the fixed data channel
     noop
     help
@@ -20,7 +21,7 @@ import sys
 
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, PKT_HELLO, PKT_DATA, PKT_FIN,
-    make_packet, parse_packet, recv_line, send_line, drain_stale_packets,
+    make_packet, parse_packet, recv_line, send_line, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -37,6 +38,7 @@ class FTPClient:
         self.host = socket.gethostbyname(host)
         self.data_port = data_port
         self.authenticated = False
+        self.type_mode = "A"   # RFC 959 default
 
         self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.conn.connect((host, control_port))
@@ -106,10 +108,11 @@ class FTPClient:
             return
         with open(local_path, "rb") as f:
             data = f.read()
+        wire_data = ascii_mask(data) if self.type_mode == "A" else data
         target = (self.host, self.data_port)
         seq = 0
-        for i in range(0, len(data), CHUNK_SIZE):
-            chunk = data[i:i + CHUNK_SIZE]
+        for i in range(0, len(wire_data), CHUNK_SIZE):
+            chunk = wire_data[i:i + CHUNK_SIZE]
             self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
             seq += 1
         self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
@@ -178,6 +181,12 @@ def repl(host):
                     print("Usage: get <remote_name> [local_file]")
                     continue
                 client.get(bits[0], bits[1] if len(bits) > 1 else None)
+            elif cmd == "type":
+                mode = (arg or "A").upper()
+                reply = client.command(f"TYPE {mode}")
+                print(reply)
+                if reply.startswith("200"):
+                    client.type_mode = mode
             elif cmd == "fixed":
                 client.set_fixed()
             elif cmd == "noop":

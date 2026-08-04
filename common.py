@@ -67,6 +67,15 @@ def drain_stale_packets(sock):
         pass
 
 
+def ascii_mask(data):
+    """RFC 959 TYPE A (NVT-ASCII) is nominally 7-bit ASCII: the sender clears
+    the high bit of every byte before it goes on the wire. A genuine text
+    file (every byte already <= 0x7F) survives this unchanged — this is what
+    the Basic Level's default ASCII transmission mode actually is, made
+    explicit rather than implicit."""
+    return bytes(b & 0x7F for b in data)
+
+
 # --- TCP control-channel line protocol ---------------------------------------
 def recv_line(conn):
     """Read a single CRLF/LF-terminated line from a TCP socket. None on EOF."""
@@ -95,12 +104,13 @@ class Reply:
     LOGIN_SUCCESS = "230 Login successful."
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
-    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP STOR RETR HELP"
+    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP TYPE STOR RETR HELP"
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
     CANT_OPEN_DATA_CONN = "425 Can't open data connection."
     FILE_UNAVAILABLE = "550 File unavailable."
+    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (supported: TYPE A)."
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."
     SYNTAX_ERROR_PARAMS = "501 Syntax error in parameters."
     NOT_IMPLEMENTED = "502 Command not implemented."
