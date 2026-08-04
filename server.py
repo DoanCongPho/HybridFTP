@@ -8,12 +8,15 @@ Basic Level (always on): USER/PASS auth, ASCII upload/download of a single
 file, one fixed data-channel mechanism, single-threaded by default.
 
 Advanced Level (opt-in): binary transfer (TYPE I) without corrupting the
-bytes that TYPE A's ascii_mask() would otherwise alter.
+bytes that TYPE A's ascii_mask() would otherwise alter, and a real
+directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM).
 """
 
 import functools
 import os
+import posixpath
 import socket
+import time
 
 print = functools.partial(print, flush=True)  # keep server log visible even when output is redirected
 
@@ -36,14 +39,30 @@ USERS = {
 }
 
 
-def safe_path(filename):
-    """Filesystem path for a STOR/RETR filename, confined to STORAGE_ROOT
-    (no nested directories yet — the whole tree is flat at this level).
-    None if the name would escape STORAGE_ROOT (e.g. via '..')."""
-    fs_path = os.path.normpath(os.path.join(STORAGE_ROOT, filename))
+def resolve_path(session, arg):
+    """Resolve an FTP-space path (relative to session.cwd, or absolute if it
+    starts with '/') to a filesystem path confined under STORAGE_ROOT.
+
+    Returns (ftp_path, fs_path), or (None, None) if arg would escape
+    STORAGE_ROOT (e.g. via '..').
+    """
+    raw = arg if arg else session.cwd
+    ftp_path = raw if raw.startswith("/") else posixpath.join(session.cwd, raw)
+    ftp_path = posixpath.normpath(ftp_path)
+    if not ftp_path.startswith("/"):
+        ftp_path = "/" + ftp_path
+    fs_path = os.path.normpath(os.path.join(STORAGE_ROOT, ftp_path.lstrip("/")))
     root = os.path.normpath(STORAGE_ROOT)
     if fs_path != root and not fs_path.startswith(root + os.sep):
-        return None
+        return None, None
+    return ftp_path, fs_path
+
+
+def safe_path(session, filename):
+    """Filesystem path for a STOR/RETR/SIZE filename, resolved against the
+    session's current directory and confined to STORAGE_ROOT. None if the
+    name would escape STORAGE_ROOT."""
+    _, fs_path = resolve_path(session, filename)
     return fs_path
 
 
@@ -54,6 +73,7 @@ class Session:
         self.username = None
         self.authenticated = False
         self.type_mode = "A"
+        self.cwd = "/"
 
         # Data-channel state. FIXED mode (Basic Level default) reuses the
         # one shared, server-wide UDP socket bound at DATA_PORT — see
@@ -68,11 +88,27 @@ class Session:
         return self.data_sock, self.client_data_addr
 
 
+def _send_over_data_channel(session, data):
+    """Send `data` to the session's registered client address. Used by RETR
+    and by LIST/NLST, which stream their listing text over the same UDP data
+    channel rather than the control channel."""
+    sock, endpoint = session.resolve_data_endpoint()
+    if endpoint is None:
+        return False
+    seq = 0
+    for i in range(0, len(data), CHUNK_SIZE):
+        chunk = data[i:i + CHUNK_SIZE]
+        sock.sendto(make_packet(PKT_DATA, seq, chunk), endpoint)
+        seq += 1
+    sock.sendto(make_packet(PKT_FIN, seq), endpoint)
+    return True
+
+
 def handle_stor(session, filename):
     if not filename:
         send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
         return
-    fs_path = safe_path(filename)
+    fs_path = safe_path(session, filename)
     if fs_path is None:
         send_line(session.conn, Reply.FILE_UNAVAILABLE)
         return
@@ -115,11 +151,11 @@ def handle_retr(session, filename):
     if not filename:
         send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
         return
-    fs_path = safe_path(filename)
+    fs_path = safe_path(session, filename)
     if fs_path is None or not os.path.isfile(fs_path):
         send_line(session.conn, Reply.FILE_UNAVAILABLE)
         return
-    sock, endpoint = session.resolve_data_endpoint()
+    _, endpoint = session.resolve_data_endpoint()
     if endpoint is None:
         send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
         return
@@ -130,14 +166,109 @@ def handle_retr(session, filename):
     # mask a throwaway copy, keep `data` (used below for the log line) as
     # the true byte count of the stored file.
     wire_data = ascii_mask(data) if session.type_mode == "A" else data
-    seq = 0
-    for i in range(0, len(wire_data), CHUNK_SIZE):
-        chunk = wire_data[i:i + CHUNK_SIZE]
-        sock.sendto(make_packet(PKT_DATA, seq, chunk), endpoint)
-        seq += 1
-    sock.sendto(make_packet(PKT_FIN, seq), endpoint)
+    if not _send_over_data_channel(session, wire_data):
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
+        return
     print(f"[+] Sent '{filename}' ({len(data)} bytes) to user '{session.username}'")
     send_line(session.conn, Reply.TRANSFER_COMPLETE)
+
+
+def handle_cwd(session, arg):
+    if not arg:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    ftp_path, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.isdir(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    session.cwd = ftp_path
+    send_line(session.conn, Reply.cwd_ok(ftp_path))
+
+
+def handle_mkd(session, arg):
+    if not arg:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    ftp_path, fs_path = resolve_path(session, arg)
+    if fs_path is None:
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    try:
+        os.mkdir(fs_path)
+    except OSError:
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    send_line(session.conn, Reply.dir_created(ftp_path))
+
+
+def handle_rmd(session, arg):
+    if not arg:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    ftp_path, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.isdir(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    try:
+        os.rmdir(fs_path)
+    except OSError:
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)  # e.g. not empty
+        return
+    send_line(session.conn, Reply.COMMAND_OK)
+
+
+def handle_list(session, arg, name_only):
+    ftp_path, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.isdir(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    _, endpoint = session.resolve_data_endpoint()
+    if endpoint is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
+    entries = sorted(os.listdir(fs_path))
+    lines = []
+    for name in entries:
+        if name_only:
+            lines.append(name)
+            continue
+        full = os.path.join(fs_path, name)
+        is_dir = os.path.isdir(full)
+        kind = "d" if is_dir else "-"
+        perms = "rwxr-xr-x" if is_dir else "rw-r--r--"
+        size = 0 if is_dir else os.path.getsize(full)
+        lines.append(f"{kind}{perms} {size:>10} {name}")
+    body = ("\n".join(lines) + "\n" if lines else "").encode("utf-8")
+    send_line(session.conn, Reply.FILE_STATUS_OK)
+    if not _send_over_data_channel(session, body):
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
+        return
+    send_line(session.conn, Reply.TRANSFER_COMPLETE)
+
+
+def handle_stat(session, arg):
+    if not arg:
+        send_line(session.conn, Reply.status(session))
+        return
+    _, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.exists(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    st = os.stat(fs_path)
+    kind = "directory" if os.path.isdir(fs_path) else "file"
+    send_line(session.conn, f"213 {kind} {st.st_size} bytes")
+
+
+def handle_mdtm(session, arg):
+    if not arg:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    _, fs_path = resolve_path(session, arg)
+    if fs_path is None or not os.path.isfile(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    ts = time.strftime("%Y%m%d%H%M%S", time.gmtime(os.path.getmtime(fs_path)))
+    send_line(session.conn, f"213 {ts}")
 
 
 def cleanup_session(session):
@@ -203,6 +334,58 @@ def handle_client(conn, addr, fixed_udp_sock):
 
                 elif cmd == "NOOP":
                     send_line(conn, Reply.COMMAND_OK)
+
+                elif cmd == "PWD":
+                    send_line(conn, Reply.pwd(session.cwd))
+
+                elif cmd == "CWD":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_cwd(session, arg)
+
+                elif cmd == "CDUP":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_cwd(session, "..")
+
+                elif cmd == "MKD":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_mkd(session, arg)
+
+                elif cmd == "RMD":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_rmd(session, arg)
+
+                elif cmd == "LIST":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_list(session, arg, name_only=False)
+
+                elif cmd == "NLST":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_list(session, arg, name_only=True)
+
+                elif cmd == "STAT":
+                    handle_stat(session, arg)
+
+                elif cmd == "MDTM":
+                    handle_mdtm(session, arg)
+
+                elif cmd == "SIZE":
+                    fs_path = safe_path(session, arg) if arg else None
+                    if fs_path and os.path.isfile(fs_path):
+                        send_line(conn, Reply.size(os.path.getsize(fs_path)))
+                    else:
+                        send_line(conn, Reply.FILE_UNAVAILABLE)
 
                 elif cmd == "STOR":
                     if not session.authenticated:

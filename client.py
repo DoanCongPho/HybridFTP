@@ -8,16 +8,28 @@ Commands:
     pass <password>
     put <local_file> [remote_name]     upload (STOR)
     get <remote_name> [local_file]     download (RETR)
+    cwd <path>                         change server directory
+    cdup                               go to parent directory
+    mkd <dirname>                      create a directory
+    rmd <dirname>                      remove an (empty) directory
+    ls / list [path]                   detailed directory listing
+    nlst [path]                        name-only directory listing
+    stat [path]                        server/session or path status
+    mdtm <filename>                    last-modified timestamp
     type {A|I}                         ASCII or binary transfer type
     fixed                              (re-)announce our address on the fixed data channel
+    pwd
+    size <filename>
     noop
     help
     quit
 """
 
 import os
+import re
 import socket
 import sys
+import time
 
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, PKT_HELLO, PKT_DATA, PKT_FIN,
@@ -138,6 +150,21 @@ class FTPClient:
         print(f"[+] Saved to {local_path} ({len(data)} bytes)")
         print(self._read_reply())
 
+    def list_dir(self, path="", name_only=False):
+        cmd = "NLST" if name_only else "LIST"
+        drain_stale_packets(self.udp_sock)
+        reply = self.command(f"{cmd} {path}".strip())
+        print(reply)
+        if not reply.startswith("150"):
+            return
+        data = self._recv_data_payload()
+        if data is None:
+            print(self._read_reply())  # drain the pending final reply — see get()'s comment
+            return
+        text = data.decode("utf-8", errors="replace")
+        print(text if text else "(empty)")
+        print(self._read_reply())
+
     def close(self):
         try:
             self.conn.close()
@@ -181,6 +208,30 @@ def repl(host):
                     print("Usage: get <remote_name> [local_file]")
                     continue
                 client.get(bits[0], bits[1] if len(bits) > 1 else None)
+            elif cmd in ("ls", "list"):
+                client.list_dir(arg, name_only=False)
+            elif cmd == "nlst":
+                client.list_dir(arg, name_only=True)
+            elif cmd == "cwd":
+                print(client.command(f"CWD {arg}"))
+            elif cmd == "cdup":
+                print(client.command("CDUP"))
+            elif cmd == "mkd":
+                print(client.command(f"MKD {arg}"))
+            elif cmd == "rmd":
+                print(client.command(f"RMD {arg}"))
+            elif cmd == "stat":
+                print(client.command(f"STAT {arg}".strip()))
+            elif cmd == "mdtm":
+                reply = client.command(f"MDTM {arg}")
+                print(reply)
+                # The wire format (YYYYMMDDhhmmss) is the exact one the spec
+                # requires for MDTM — reformat only for display, don't touch
+                # what's sent/received on the wire.
+                m = re.match(r"213 (\d{14})", reply)
+                if m:
+                    t = time.strptime(m.group(1), "%Y%m%d%H%M%S")
+                    print(f"[+] Last modified: {time.strftime('%Y-%m-%d %H:%M:%S', t)} UTC")
             elif cmd == "type":
                 mode = (arg or "A").upper()
                 reply = client.command(f"TYPE {mode}")
@@ -189,6 +240,10 @@ def repl(host):
                     client.type_mode = mode
             elif cmd == "fixed":
                 client.set_fixed()
+            elif cmd == "pwd":
+                print(client.command("PWD"))
+            elif cmd == "size":
+                print(client.command(f"SIZE {arg}"))
             elif cmd == "noop":
                 print(client.command("NOOP"))
             elif cmd == "help":

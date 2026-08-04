@@ -109,7 +109,8 @@ class Reply:
     LOGIN_SUCCESS = "230 Login successful."
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
-    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP TYPE MODE STOR RETR HELP"
+    HELP_TEXT = ("214 Commands: USER PASS QUIT NOOP PWD CWD CDUP MKD RMD LIST NLST STAT "
+                 "SIZE MDTM TYPE MODE STOR RETR HELP")
     MODE_NOT_IMPLEMENTED = "502 Command not implemented (Advanced Level supports MODE S only)."
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
@@ -121,3 +122,24 @@ class Reply:
     SYNTAX_ERROR_PARAMS = "501 Syntax error in parameters."
     NOT_IMPLEMENTED = "502 Command not implemented."
     GOODBYE = "221 Goodbye."
+
+    @staticmethod
+    def pwd(path):
+        return f'257 "{path}"'
+
+    @staticmethod
+    def size(nbytes):
+        return f"213 {nbytes}"
+
+    @staticmethod
+    def cwd_ok(path):
+        return f'250 Directory changed to "{path}".'
+
+    @staticmethod
+    def dir_created(path):
+        return f'257 "{path}" created.'
+
+    @staticmethod
+    def status(session):
+        return (f"211 user={session.username!r} cwd={session.cwd} "
+                f"mode={session.data_mode} type={session.type_mode}")
