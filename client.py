@@ -6,6 +6,7 @@ Usage:
 Commands:
     user <name>
     pass <password>
+    fixed                              (re-)announce our address on the fixed data channel
     noop
     help
     quit
@@ -14,14 +15,24 @@ Commands:
 import socket
 import sys
 
-from common import CONTROL_PORT, recv_line, send_line
+from common import CONTROL_PORT, DATA_PORT, PKT_HELLO, make_packet, recv_line, send_line
 
 
 class FTPClient:
-    def __init__(self, host, control_port=CONTROL_PORT):
+    def __init__(self, host, control_port=CONTROL_PORT, data_port=DATA_PORT):
+        # Resolve to a numeric IP once, up front — recvfrom() always hands
+        # back a resolved numeric IP, so keeping `host` as a hostname would
+        # make later address comparisons never match.
+        self.host = socket.gethostbyname(host)
+        self.data_port = data_port
         self.authenticated = False
+
         self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.conn.connect((host, control_port))
+
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.bind(("", 0))  # ephemeral port; server discovers it via our HELLO packet
+
         print(self._read_reply())
 
     def _read_reply(self):
@@ -34,11 +45,19 @@ class FTPClient:
         send_line(self.conn, text)
         return self._read_reply()
 
+    def set_fixed(self):
+        """Basic Level's fixed data-channel mechanism: HELLO the server's
+        well-known UDP port so it learns our address."""
+        self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), (self.host, self.data_port))
+        print(f"[*] Data mode: FIXED ({self.host}:{self.data_port})")
+
     def login(self, username, password):
         reply = self.command(f"PASS {password}")
         print(reply)
         if reply.startswith("230"):
             self.authenticated = True
+            self.udp_sock.sendto(make_packet(PKT_HELLO, 0, username.encode("ascii")),
+                                  (self.host, self.data_port))
         return self.authenticated
 
     def close(self):
@@ -46,6 +65,7 @@ class FTPClient:
             self.conn.close()
         except OSError:
             pass
+        self.udp_sock.close()
 
 
 def repl(host):
@@ -71,6 +91,8 @@ def repl(host):
                     print("[!] Run 'user <name>' first.")
                     continue
                 client.login(username, arg)
+            elif cmd == "fixed":
+                client.set_fixed()
             elif cmd == "noop":
                 print(client.command("NOOP"))
             elif cmd == "help":

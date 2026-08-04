@@ -1,9 +1,11 @@
 """Hybrid FTP server — Basic Level.
 
 Control channel: TCP, fixed port (see common.CONTROL_PORT).
+Data channel:    UDP, fixed port (see common.DATA_PORT) — Basic Level's one
+                  fixed data-channel connection mechanism.
 
 Basic Level (always on): USER/PASS auth, single-threaded by default. File
-transfer and the UDP data channel land in later commits.
+transfer itself lands in a later commit; this one wires up the channel.
 """
 
 import functools
@@ -11,7 +13,10 @@ import socket
 
 print = functools.partial(print, flush=True)  # keep server log visible even when output is redirected
 
-from common import CONTROL_PORT, CONTROL_IDLE_TIMEOUT, Reply, recv_line, send_line
+from common import (
+    CONTROL_PORT, DATA_PORT, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
+    PKT_HELLO, parse_packet, recv_line, send_line,
+)
 from config import CONFIG
 
 USERS = {
@@ -21,11 +26,23 @@ USERS = {
 
 
 class Session:
-    def __init__(self, conn, addr):
+    def __init__(self, conn, addr, fixed_udp_sock):
         self.conn = conn
         self.addr = addr
         self.username = None
         self.authenticated = False
+
+        # Data-channel state. FIXED mode (Basic Level default) reuses the
+        # one shared, server-wide UDP socket bound at DATA_PORT — see
+        # resolve_data_endpoint() below.
+        self.data_mode = DataMode.FIXED
+        self.data_sock = fixed_udp_sock
+        self.client_data_addr = None      # learned from the client's HELLO datagram
+
+    def resolve_data_endpoint(self):
+        """Single seam for finding out where/how to send or receive file
+        data for this session: (socket_to_use, client_address)."""
+        return self.data_sock, self.client_data_addr
 
 
 def cleanup_session(session):
@@ -38,8 +55,8 @@ def cleanup_session(session):
     print(f"[*] Session for {session.addr} (user={session.username!r}) closed.")
 
 
-def handle_client(conn, addr):
-    session = Session(conn, addr)
+def handle_client(conn, addr, fixed_udp_sock):
+    session = Session(conn, addr, fixed_udp_sock)
     print(f"[+] Connection from {addr}")
     # Idle timeout on the control channel: if a client dies without ever
     # sending FIN/RST (power loss, network drop, VM freeze — not just a
@@ -74,6 +91,18 @@ def handle_client(conn, addr):
                     if session.username and USERS.get(session.username) == arg:
                         session.authenticated = True
                         send_line(conn, Reply.LOGIN_SUCCESS)
+                        # Fixed data-channel handshake: wait for the client's
+                        # HELLO datagram so we learn its UDP address. This is
+                        # what makes FIXED a genuine "connection" instead of
+                        # just a well-known port nobody ever addresses.
+                        session.data_sock.settimeout(SOCK_TIMEOUT)
+                        try:
+                            raw, caddr = session.data_sock.recvfrom(1024)
+                            pkt_type, _, _, valid = parse_packet(raw)
+                            if valid and pkt_type == PKT_HELLO:
+                                session.client_data_addr = caddr
+                        except socket.timeout:
+                            pass
                     else:
                         send_line(conn, Reply.NOT_LOGGED_IN)
 
@@ -103,20 +132,24 @@ def handle_client(conn, addr):
 def main():
     host = CONFIG.get("server", "host", fallback="0.0.0.0")
 
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.bind((host, DATA_PORT))
+
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcp_sock.bind((host, CONTROL_PORT))
     tcp_sock.listen(1)
-    print(f"[*] Hybrid FTP server listening on TCP {CONTROL_PORT}")
+    print(f"[*] Hybrid FTP server listening on TCP {CONTROL_PORT}, UDP data port {DATA_PORT}")
 
     try:
         while True:
             conn, addr = tcp_sock.accept()
-            handle_client(conn, addr)   # single-threaded: one client at a time (Basic Level default)
+            handle_client(conn, addr, udp_sock)   # single-threaded: one client at a time (Basic Level default)
     except KeyboardInterrupt:
         print("\n[*] Server shutting down.")
     finally:
         tcp_sock.close()
+        udp_sock.close()
 
 
 if __name__ == "__main__":
