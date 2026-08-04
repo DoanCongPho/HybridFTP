@@ -6,16 +6,27 @@ Usage:
 Commands:
     user <name>
     pass <password>
+    put <local_file> [remote_name]     upload (STOR)
+    get <remote_name> [local_file]     download (RETR)
     fixed                              (re-)announce our address on the fixed data channel
     noop
     help
     quit
 """
 
+import os
 import socket
 import sys
 
-from common import CONTROL_PORT, DATA_PORT, PKT_HELLO, make_packet, recv_line, send_line
+from common import (
+    CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, PKT_HELLO, PKT_DATA, PKT_FIN,
+    make_packet, parse_packet, recv_line, send_line, drain_stale_packets,
+)
+from config import CONFIG
+
+DOWNLOAD_DIR_CFG = CONFIG.get("client", "download_dir", fallback="client_downloads")
+DOWNLOAD_DIR = (DOWNLOAD_DIR_CFG if os.path.isabs(DOWNLOAD_DIR_CFG)
+                 else os.path.join(os.path.dirname(os.path.abspath(__file__)), DOWNLOAD_DIR_CFG))
 
 
 class FTPClient:
@@ -60,6 +71,70 @@ class FTPClient:
                                   (self.host, self.data_port))
         return self.authenticated
 
+    def _recv_data_payload(self):
+        """Receive one data-channel transfer (PKT_DATA... PKT_FIN) and
+        reassemble it in sequence order. Callers must drain_stale_packets()
+        themselves *before* sending the RETR request — the server may start
+        sending the instant it sees our request, so draining at this point
+        risks discarding this transfer's own first packets."""
+        chunks = {}
+        self.udp_sock.settimeout(SOCK_TIMEOUT)
+        try:
+            while True:
+                raw, _addr = self.udp_sock.recvfrom(CHUNK_SIZE + 64)
+                pkt_type, seq, payload, valid = parse_packet(raw)
+                if not valid:
+                    print(f"[!] Corrupt packet seq={seq} dropped.")
+                    continue
+                if pkt_type == PKT_FIN:
+                    break
+                if pkt_type == PKT_DATA:
+                    chunks[seq] = payload
+        except socket.timeout:
+            print("[!] Data transfer timed out.")
+            return None
+        return b"".join(chunks[s] for s in sorted(chunks))
+
+    def put(self, local_path, remote_name=None):
+        if not os.path.isfile(local_path):
+            print(f"[!] Local file not found: {local_path}")
+            return
+        remote_name = remote_name or os.path.basename(local_path)
+        reply = self.command(f"STOR {remote_name}")
+        print(reply)
+        if not reply.startswith("150"):
+            return
+        with open(local_path, "rb") as f:
+            data = f.read()
+        target = (self.host, self.data_port)
+        seq = 0
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunk = data[i:i + CHUNK_SIZE]
+            self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
+            seq += 1
+        self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
+        print(self._read_reply())
+
+    def get(self, remote_name, local_path=None):
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        local_path = local_path or os.path.join(DOWNLOAD_DIR, remote_name)
+        # Drain BEFORE asking — once the server sees RETR it may start
+        # sending immediately, so draining any later risks discarding this
+        # transfer's own first packets.
+        drain_stale_packets(self.udp_sock)
+        reply = self.command(f"RETR {remote_name}")
+        print(reply)
+        if not reply.startswith("150"):
+            return
+        data = self._recv_data_payload()
+        if data is None:
+            print(self._read_reply())
+            return
+        with open(local_path, "wb") as f:
+            f.write(data)
+        print(f"[+] Saved to {local_path} ({len(data)} bytes)")
+        print(self._read_reply())
+
     def close(self):
         try:
             self.conn.close()
@@ -91,6 +166,18 @@ def repl(host):
                     print("[!] Run 'user <name>' first.")
                     continue
                 client.login(username, arg)
+            elif cmd == "put":
+                bits = arg.split(maxsplit=1)
+                if not bits:
+                    print("Usage: put <local_file> [remote_name]")
+                    continue
+                client.put(bits[0], bits[1] if len(bits) > 1 else None)
+            elif cmd == "get":
+                bits = arg.split(maxsplit=1)
+                if not bits:
+                    print("Usage: get <remote_name> [local_file]")
+                    continue
+                client.get(bits[0], bits[1] if len(bits) > 1 else None)
             elif cmd == "fixed":
                 client.set_fixed()
             elif cmd == "noop":

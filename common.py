@@ -25,6 +25,8 @@ class DataMode:
 
 # --- UDP packet framing -------------------------------------------------------
 PKT_HELLO = 0   # client -> server: "here is my UDP address, remember it for this session"
+PKT_DATA = 1    # a chunk of file payload
+PKT_FIN = 2     # marks the end of a transfer
 
 HEADER_FMT = "!BII"       # type(1B) + seq(4B) + checksum(4B)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
@@ -93,7 +95,12 @@ class Reply:
     LOGIN_SUCCESS = "230 Login successful."
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
-    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP HELP"
+    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP STOR RETR HELP"
+    FILE_STATUS_OK = "150 File status okay, opening data connection."
+    TRANSFER_COMPLETE = "226 Transfer complete."
+    TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
+    CANT_OPEN_DATA_CONN = "425 Can't open data connection."
+    FILE_UNAVAILABLE = "550 File unavailable."
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."
     SYNTAX_ERROR_PARAMS = "501 Syntax error in parameters."
     NOT_IMPLEMENTED = "502 Command not implemented."

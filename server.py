@@ -4,25 +4,44 @@ Control channel: TCP, fixed port (see common.CONTROL_PORT).
 Data channel:    UDP, fixed port (see common.DATA_PORT) — Basic Level's one
                   fixed data-channel connection mechanism.
 
-Basic Level (always on): USER/PASS auth, single-threaded by default. File
-transfer itself lands in a later commit; this one wires up the channel.
+Basic Level (always on): USER/PASS auth, upload/download of a single file
+over the fixed data channel, single-threaded by default.
 """
 
 import functools
+import os
 import socket
 
 print = functools.partial(print, flush=True)  # keep server log visible even when output is redirected
 
 from common import (
-    CONTROL_PORT, DATA_PORT, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
-    PKT_HELLO, parse_packet, recv_line, send_line,
+    CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
+    PKT_HELLO, PKT_DATA, PKT_FIN,
+    make_packet, parse_packet, recv_line, send_line, drain_stale_packets,
 )
 from config import CONFIG
+
+_storage_root_cfg = CONFIG.get("server", "storage_root", fallback="server_storage")
+if os.path.isabs(_storage_root_cfg):
+    STORAGE_ROOT = _storage_root_cfg
+else:
+    STORAGE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), _storage_root_cfg)
 
 USERS = {
     "alice": "password123",
     "bob": "hunter2",
 }
+
+
+def safe_path(filename):
+    """Filesystem path for a STOR/RETR filename, confined to STORAGE_ROOT
+    (no nested directories yet — the whole tree is flat at this level).
+    None if the name would escape STORAGE_ROOT (e.g. via '..')."""
+    fs_path = os.path.normpath(os.path.join(STORAGE_ROOT, filename))
+    root = os.path.normpath(STORAGE_ROOT)
+    if fs_path != root and not fs_path.startswith(root + os.sep):
+        return None
+    return fs_path
 
 
 class Session:
@@ -43,6 +62,74 @@ class Session:
         """Single seam for finding out where/how to send or receive file
         data for this session: (socket_to_use, client_address)."""
         return self.data_sock, self.client_data_addr
+
+
+def handle_stor(session, filename):
+    if not filename:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    fs_path = safe_path(filename)
+    if fs_path is None:
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    sock, expected_addr = session.resolve_data_endpoint()
+    if expected_addr is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
+    # Drain BEFORE telling the client to start sending (FILE_STATUS_OK) — the
+    # client could start firing data the instant it sees "150".
+    drain_stale_packets(sock)
+    send_line(session.conn, Reply.FILE_STATUS_OK)
+
+    chunks = {}
+    sock.settimeout(SOCK_TIMEOUT)
+    try:
+        while True:
+            raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
+            if addr != expected_addr:
+                continue
+            pkt_type, seq, payload, valid = parse_packet(raw)
+            if not valid:
+                print(f"[!] Corrupt packet seq={seq} dropped.")
+                continue
+            if pkt_type == PKT_FIN:
+                break
+            if pkt_type == PKT_DATA:
+                chunks[seq] = payload
+    except socket.timeout:
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
+        return
+    data = b"".join(chunks[seq] for seq in sorted(chunks))
+
+    with open(fs_path, "wb") as f:
+        f.write(data)
+    print(f"[+] Stored '{filename}' ({len(data)} bytes) from user '{session.username}'")
+    send_line(session.conn, Reply.TRANSFER_COMPLETE)
+
+
+def handle_retr(session, filename):
+    if not filename:
+        send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
+        return
+    fs_path = safe_path(filename)
+    if fs_path is None or not os.path.isfile(fs_path):
+        send_line(session.conn, Reply.FILE_UNAVAILABLE)
+        return
+    sock, endpoint = session.resolve_data_endpoint()
+    if endpoint is None:
+        send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
+        return
+    send_line(session.conn, Reply.FILE_STATUS_OK)
+    with open(fs_path, "rb") as f:
+        data = f.read()
+    seq = 0
+    for i in range(0, len(data), CHUNK_SIZE):
+        chunk = data[i:i + CHUNK_SIZE]
+        sock.sendto(make_packet(PKT_DATA, seq, chunk), endpoint)
+        seq += 1
+    sock.sendto(make_packet(PKT_FIN, seq), endpoint)
+    print(f"[+] Sent '{filename}' ({len(data)} bytes) to user '{session.username}'")
+    send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
 
 def cleanup_session(session):
@@ -109,6 +196,18 @@ def handle_client(conn, addr, fixed_udp_sock):
                 elif cmd == "NOOP":
                     send_line(conn, Reply.COMMAND_OK)
 
+                elif cmd == "STOR":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_stor(session, arg)
+
+                elif cmd == "RETR":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_retr(session, arg)
+
                 elif cmd == "HELP":
                     send_line(conn, Reply.HELP_TEXT)
 
@@ -131,6 +230,7 @@ def handle_client(conn, addr, fixed_udp_sock):
 
 def main():
     host = CONFIG.get("server", "host", fallback="0.0.0.0")
+    os.makedirs(STORAGE_ROOT, exist_ok=True)
 
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.bind((host, DATA_PORT))
@@ -140,6 +240,7 @@ def main():
     tcp_sock.bind((host, CONTROL_PORT))
     tcp_sock.listen(1)
     print(f"[*] Hybrid FTP server listening on TCP {CONTROL_PORT}, UDP data port {DATA_PORT}")
+    print(f"[*] Storage root: {STORAGE_ROOT}")
 
     try:
         while True:
