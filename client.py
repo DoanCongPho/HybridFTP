@@ -1,4 +1,4 @@
-"""Hybrid FTP client — Basic Level. Interactive CLI.
+"""Hybrid FTP client — Basic + Advanced Level. Interactive CLI.
 
 Usage:
     python3 client.py <server_host>
@@ -8,7 +8,7 @@ Commands:
     pass <password>
     put <local_file> [remote_name]     upload (STOR)
     get <remote_name> [local_file]     download (RETR)
-    type A                             ASCII transfer type (default)
+    type {A|I}                         ASCII or binary transfer type
     fixed                              (re-)announce our address on the fixed data channel
     noop
     help

@@ -70,9 +70,14 @@ def drain_stale_packets(sock):
 def ascii_mask(data):
     """RFC 959 TYPE A (NVT-ASCII) is nominally 7-bit ASCII: the sender clears
     the high bit of every byte before it goes on the wire. A genuine text
-    file (every byte already <= 0x7F) survives this unchanged — this is what
-    the Basic Level's default ASCII transmission mode actually is, made
-    explicit rather than implicit."""
+    file (every byte already <= 0x7F) survives this unchanged. A binary file
+    (image, archive, ...) routinely has bytes >= 0x80 — roughly half of them,
+    for arbitrary binary data — and those get permanently altered. This is
+    irreversible by construction: there is no decode step, only encode. It's
+    the textbook reason FTP folklore insists on TYPE I for binary transfers;
+    called by the sending side only (handle_retr()/put()), never the
+    receiving side, since the corrupted bytes it produces ARE what the
+    receiver is meant to get, corruption and all."""
     return bytes(b & 0x7F for b in data)
 
 
@@ -104,13 +109,14 @@ class Reply:
     LOGIN_SUCCESS = "230 Login successful."
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
-    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP TYPE STOR RETR HELP"
+    HELP_TEXT = "214 Commands: USER PASS QUIT NOOP TYPE MODE STOR RETR HELP"
+    MODE_NOT_IMPLEMENTED = "502 Command not implemented (Advanced Level supports MODE S only)."
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
     CANT_OPEN_DATA_CONN = "425 Can't open data connection."
     FILE_UNAVAILABLE = "550 File unavailable."
-    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (supported: TYPE A)."
+    TYPE_NOT_IMPLEMENTED = "502 Command not implemented (supported: TYPE A, TYPE I)."
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."
     SYNTAX_ERROR_PARAMS = "501 Syntax error in parameters."
     NOT_IMPLEMENTED = "502 Command not implemented."

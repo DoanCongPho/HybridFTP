@@ -1,11 +1,14 @@
-"""Hybrid FTP server — Basic Level.
+"""Hybrid FTP server — Basic + Advanced Level.
 
 Control channel: TCP, fixed port (see common.CONTROL_PORT).
 Data channel:    UDP, fixed port (see common.DATA_PORT) — Basic Level's one
                   fixed data-channel connection mechanism.
 
-Basic Level (always on): USER/PASS auth, upload/download of a single file
-over the fixed data channel, single-threaded by default.
+Basic Level (always on): USER/PASS auth, ASCII upload/download of a single
+file, one fixed data-channel mechanism, single-threaded by default.
+
+Advanced Level (opt-in): binary transfer (TYPE I) without corrupting the
+bytes that TYPE A's ascii_mask() would otherwise alter.
 """
 
 import functools
@@ -215,11 +218,17 @@ def handle_client(conn, addr, fixed_udp_sock):
 
                 elif cmd == "TYPE":
                     mode = arg.upper()
-                    if mode == "A":
+                    if mode in ("A", "I"):
                         session.type_mode = mode
                         send_line(conn, Reply.COMMAND_OK)
                     else:
                         send_line(conn, Reply.TYPE_NOT_IMPLEMENTED)
+
+                elif cmd == "MODE":
+                    if arg.upper() == "S":
+                        send_line(conn, Reply.COMMAND_OK)
+                    else:
+                        send_line(conn, Reply.MODE_NOT_IMPLEMENTED)
 
                 elif cmd == "HELP":
                     send_line(conn, Reply.HELP_TEXT)
