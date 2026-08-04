@@ -37,7 +37,7 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
-    drain_stale_packets, ascii_mask,
+    gbn_send, gbn_receive, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -47,6 +47,11 @@ DOWNLOAD_DIR = (DOWNLOAD_DIR_CFG if os.path.isabs(DOWNLOAD_DIR_CFG)
 
 _DEFAULT_DATA_MODE = CONFIG.get("client", "data_mode", fallback="fixed").strip().lower()
 _MODE_MAP = {"fixed": DataMode.FIXED, "active": DataMode.ACTIVE, "passive": DataMode.PASSIVE}
+
+# Excellent Level: Go-Back-N reliable-UDP layer. "none" (default) preserves
+# the exact best-effort framing above; must match server.py's [reliability]
+# setting to interoperate — see the comment above gbn_send() in common.py.
+RELIABILITY_MODE = CONFIG.get("reliability", "mode", fallback="none").strip().lower()
 
 
 class FTPClient:
@@ -155,10 +160,17 @@ class FTPClient:
 
     def _recv_data_payload(self):
         """Receive one data-channel transfer (PKT_DATA... PKT_FIN) and
-        reassemble it in sequence order. Callers must drain_stale_packets()
-        themselves *before* sending the RETR request — the server may start
-        sending the instant it sees our request, so draining at this point
-        risks discarding this transfer's own first packets."""
+        reassemble it in sequence order — reliably via Go-Back-N if
+        [reliability] mode=gbn, otherwise the original best-effort framing.
+        Callers must drain_stale_packets() themselves *before* sending the
+        RETR request — the server may start sending the instant it sees our
+        request, so draining at this point risks discarding this transfer's
+        own first packets."""
+        if RELIABILITY_MODE == "gbn":
+            data = gbn_receive(self.udp_sock, self._data_target())
+            if data is None:
+                print("[!] Data transfer timed out.")
+            return data
         chunks = {}
         self.udp_sock.settimeout(SOCK_TIMEOUT)
         try:
@@ -190,12 +202,17 @@ class FTPClient:
             data = f.read()
         wire_data = ascii_mask(data) if self.type_mode == "A" else data
         target = self._data_target()
-        seq = 0
-        for i in range(0, len(wire_data), CHUNK_SIZE):
-            chunk = wire_data[i:i + CHUNK_SIZE]
-            self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
-            seq += 1
-        self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
+        if RELIABILITY_MODE == "gbn":
+            if not gbn_send(self.udp_sock, target, wire_data):
+                print("[!] Upload failed: server did not acknowledge (timed out).")
+                return
+        else:
+            seq = 0
+            for i in range(0, len(wire_data), CHUNK_SIZE):
+                chunk = wire_data[i:i + CHUNK_SIZE]
+                self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
+                seq += 1
+            self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
         print(self._read_reply())
 
     def get(self, remote_name, local_path=None):

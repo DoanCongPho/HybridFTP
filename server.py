@@ -11,6 +11,10 @@ Advanced Level (opt-in via config.ini, see config.py): binary transfer
 (TYPE I), a real directory tree (CWD/CDUP/MKD/RMD/LIST/NLST/STAT/MDTM),
 Active/Passive data-mode switching (PORT/PASV), and a multi-threaded server
 with an active-session table.
+
+Excellent Level (opt-in): a custom Go-Back-N reliable-UDP layer
+([reliability] mode=gbn in common.py) as an alternative to the best-effort
+UDP framing above.
 """
 
 import functools
@@ -26,7 +30,8 @@ print = functools.partial(print, flush=True)  # keep server log visible even whe
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
-    make_packet, parse_packet, parse_port_arg, recv_line, send_line, drain_stale_packets, ascii_mask,
+    make_packet, parse_packet, parse_port_arg, recv_line, send_line,
+    gbn_send, gbn_receive, drain_stale_packets, ascii_mask,
 )
 from config import CONFIG
 
@@ -51,6 +56,11 @@ PASSIVE_PORT_RANGE = (
 )
 
 THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single | thread
+
+# Excellent Level: Go-Back-N reliable-UDP layer. "none" (default) preserves
+# the exact best-effort framing above; both server and client must agree on
+# this, so it's read from the same [reliability] section by both files.
+RELIABILITY_MODE = CONFIG.get("reliability", "mode", fallback="none").strip().lower()
 
 USERS = {
     "alice": "password123",
@@ -151,12 +161,16 @@ class Session:
 
 
 def _send_over_data_channel(session, data):
-    """Send `data` to the session's registered client address. Used by RETR
-    and by LIST/NLST, which stream their listing text over the same UDP data
+    """Send `data` to the session's registered client address — reliably via
+    Go-Back-N if [reliability] mode=gbn, otherwise the original best-effort
+    framing (checksummed/sequenced, no ACK/retransmit). Used by RETR and by
+    LIST/NLST, which stream their listing text over the same UDP data
     channel rather than the control channel."""
     sock, endpoint = session.resolve_data_endpoint()
     if endpoint is None:
         return False
+    if RELIABILITY_MODE == "gbn":
+        return gbn_send(sock, endpoint, data)
     seq = 0
     for i in range(0, len(data), CHUNK_SIZE):
         chunk = data[i:i + CHUNK_SIZE]
@@ -183,25 +197,31 @@ def handle_stor(session, filename):
     drain_stale_packets(sock)
     send_line(session.conn, Reply.FILE_STATUS_OK)
 
-    chunks = {}
-    sock.settimeout(SOCK_TIMEOUT)
-    try:
-        while True:
-            raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
-            if addr != expected_addr:
-                continue
-            pkt_type, seq, payload, valid = parse_packet(raw)
-            if not valid:
-                print(f"[!] Corrupt packet seq={seq} dropped.")
-                continue
-            if pkt_type == PKT_FIN:
-                break
-            if pkt_type == PKT_DATA:
-                chunks[seq] = payload
-    except socket.timeout:
-        send_line(session.conn, Reply.TRANSFER_ABORTED)
-        return
-    data = b"".join(chunks[seq] for seq in sorted(chunks))
+    if RELIABILITY_MODE == "gbn":
+        data = gbn_receive(sock, expected_addr)
+        if data is None:
+            send_line(session.conn, Reply.TRANSFER_ABORTED)
+            return
+    else:
+        chunks = {}
+        sock.settimeout(SOCK_TIMEOUT)
+        try:
+            while True:
+                raw, addr = sock.recvfrom(CHUNK_SIZE + 64)
+                if addr != expected_addr:
+                    continue
+                pkt_type, seq, payload, valid = parse_packet(raw)
+                if not valid:
+                    print(f"[!] Corrupt packet seq={seq} dropped.")
+                    continue
+                if pkt_type == PKT_FIN:
+                    break
+                if pkt_type == PKT_DATA:
+                    chunks[seq] = payload
+        except socket.timeout:
+            send_line(session.conn, Reply.TRANSFER_ABORTED)
+            return
+        data = b"".join(chunks[seq] for seq in sorted(chunks))
 
     with open(fs_path, "wb") as f:
         f.write(data)
