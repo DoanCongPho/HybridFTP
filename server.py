@@ -61,6 +61,9 @@ THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single
 # the exact best-effort framing above; both server and client must agree on
 # this, so it's read from the same [reliability] section by both files.
 RELIABILITY_MODE = CONFIG.get("reliability", "mode", fallback="none").strip().lower()
+GBN_WINDOW_SIZE = CONFIG.getint("reliability", "window_size", fallback=4)
+GBN_RTO = CONFIG.getint("reliability", "rto_ms", fallback=300) / 1000.0
+GBN_MAX_RETRIES = CONFIG.getint("reliability", "max_retries", fallback=30)
 
 USERS = {
     "alice": "password123",
@@ -170,7 +173,11 @@ def _send_over_data_channel(session, data):
     if endpoint is None:
         return False
     if RELIABILITY_MODE == "gbn":
-        return gbn_send(sock, endpoint, data)
+        def _log_retransmit(base, next_seq, retries):
+            print(f"[GBN] retransmit window seq={base}..{next_seq - 1} "
+                  f"(retry #{retries}) to {endpoint} — real packet loss detected")
+        return gbn_send(sock, endpoint, data, window_size=GBN_WINDOW_SIZE,
+                         rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=_log_retransmit)
     seq = 0
     for i in range(0, len(data), CHUNK_SIZE):
         chunk = data[i:i + CHUNK_SIZE]
@@ -198,7 +205,11 @@ def handle_stor(session, filename):
     send_line(session.conn, Reply.FILE_STATUS_OK)
 
     if RELIABILITY_MODE == "gbn":
-        data = gbn_receive(sock, expected_addr)
+        def _log_reack(expected_seq, got_seq):
+            print(f"[GBN] out-of-order/duplicate/corrupt from {expected_addr} "
+                  f"(expected seq={expected_seq}, got={got_seq}) — re-ACKing {expected_seq - 1}")
+        data = gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES,
+                            on_reack=_log_reack)
         if data is None:
             send_line(session.conn, Reply.TRANSFER_ABORTED)
             return

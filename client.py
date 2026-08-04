@@ -52,6 +52,9 @@ _MODE_MAP = {"fixed": DataMode.FIXED, "active": DataMode.ACTIVE, "passive": Data
 # the exact best-effort framing above; must match server.py's [reliability]
 # setting to interoperate — see the comment above gbn_send() in common.py.
 RELIABILITY_MODE = CONFIG.get("reliability", "mode", fallback="none").strip().lower()
+GBN_WINDOW_SIZE = CONFIG.getint("reliability", "window_size", fallback=4)
+GBN_RTO = CONFIG.getint("reliability", "rto_ms", fallback=300) / 1000.0
+GBN_MAX_RETRIES = CONFIG.getint("reliability", "max_retries", fallback=30)
 
 
 class FTPClient:
@@ -167,7 +170,13 @@ class FTPClient:
         request, so draining at this point risks discarding this transfer's
         own first packets."""
         if RELIABILITY_MODE == "gbn":
-            data = gbn_receive(self.udp_sock, self._data_target())
+            target = self._data_target()
+
+            def _log_reack(expected_seq, got_seq):
+                print(f"[GBN] out-of-order/duplicate/corrupt from {target} "
+                      f"(expected seq={expected_seq}, got={got_seq}) — re-ACKing {expected_seq - 1}")
+            data = gbn_receive(self.udp_sock, target, rto=GBN_RTO,
+                                max_retries=GBN_MAX_RETRIES, on_reack=_log_reack)
             if data is None:
                 print("[!] Data transfer timed out.")
             return data
@@ -203,7 +212,11 @@ class FTPClient:
         wire_data = ascii_mask(data) if self.type_mode == "A" else data
         target = self._data_target()
         if RELIABILITY_MODE == "gbn":
-            if not gbn_send(self.udp_sock, target, wire_data):
+            def _log_retransmit(base, next_seq, retries):
+                print(f"[GBN] retransmit window seq={base}..{next_seq - 1} "
+                      f"(retry #{retries}) to {target} — real packet loss detected")
+            if not gbn_send(self.udp_sock, target, wire_data, window_size=GBN_WINDOW_SIZE,
+                             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=_log_retransmit):
                 print("[!] Upload failed: server did not acknowledge (timed out).")
                 return
         else:
