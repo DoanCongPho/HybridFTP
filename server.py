@@ -28,7 +28,8 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, CONTROL_IDLE_TIMEOUT, DataMode, Reply,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_port_arg, recv_line, send_line,
-    gbn_send, gbn_receive, compute_hash, drain_stale_packets, ascii_mask,
+    gbn_send, gbn_receive, compute_hash, drain_stale_packets,
+    encode_ascii_transfer, decode_ascii_transfer,
 )
 from config import CONFIG
 
@@ -267,9 +268,15 @@ def handle_stor(session, filename):
             return
         data = b"".join(chunks[seq] for seq in sorted(chunks))
 
+    try:
+        stored_data = decode_ascii_transfer(data) if session.type_mode == "A" else data
+    except (UnicodeDecodeError, ValueError):
+        send_line(session.conn, Reply.TRANSFER_ABORTED)
+        return
+
     with open(fs_path, "wb") as f:
-        f.write(data)
-    print(f"[+] Stored '{filename}' ({len(data)} bytes) from user '{session.username}'")
+        f.write(stored_data)
+    print(f"[+] Stored '{filename}' ({len(stored_data)} bytes) from user '{session.username}'")
     send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
 
@@ -285,13 +292,15 @@ def handle_retr(session, filename):
     if endpoint is None:
         send_line(session.conn, Reply.CANT_OPEN_DATA_CONN)
         return
-    send_line(session.conn, Reply.FILE_STATUS_OK)
     with open(fs_path, "rb") as f:
         data = f.read()
-    # TYPE A only affects what goes on the wire, never the file on disk —
-    # mask a throwaway copy, keep `data` (used below for the log line) as
-    # the true byte count of the stored file.
-    wire_data = ascii_mask(data) if session.type_mode == "A" else data
+    try:
+        wire_data = encode_ascii_transfer(data) if session.type_mode == "A" else data
+    except UnicodeDecodeError:
+        send_line(session.conn, Reply.ASCII_CONVERSION_FAILED)
+        return
+
+    send_line(session.conn, Reply.FILE_STATUS_OK)
     if not _send_over_data_channel(session, wire_data):
         send_line(session.conn, Reply.TRANSFER_ABORTED)
         return

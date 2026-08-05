@@ -38,7 +38,8 @@ from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
     PKT_HELLO, PKT_DATA, PKT_FIN,
     make_packet, parse_packet, parse_pasv_reply, format_port_arg, recv_line, send_line,
-    gbn_send, gbn_receive, compute_hash, drain_stale_packets, ascii_mask,
+    gbn_send, gbn_receive, compute_hash, drain_stale_packets,
+    encode_ascii_transfer, decode_ascii_transfer,
 )
 from config import CONFIG
 
@@ -230,17 +231,18 @@ class FTPClient:
             print(f"[!] Local file not found: {local_path}")
             return
         remote_name = remote_name or os.path.basename(local_path)
+        with open(local_path, "rb") as f:
+            data = f.read()
+        try:
+            wire_data = encode_ascii_transfer(data) if self.type_mode == "A" else data
+        except UnicodeDecodeError:
+            print("[!] TYPE A requires a 7-bit ASCII text file; use 'type I' for binary data.")
+            return
+
         reply = self.command(f"STOR {remote_name}")
         print(reply)
         if not reply.startswith("150"):
             return
-        with open(local_path, "rb") as f:
-            data = f.read()
-        # TYPE A masks a throwaway copy for the wire only — `data` (the true
-        # local bytes) is what gets hash-verified below, so a binary file
-        # sent under ASCII mode correctly reports a MISMATCH instead of
-        # comparing the corrupted copy against itself.
-        wire_data = ascii_mask(data) if self.type_mode == "A" else data
         target = self._data_target()
         if RELIABILITY_MODE == "gbn":
             def _log_retransmit(base, next_seq, retries):
@@ -259,7 +261,8 @@ class FTPClient:
             self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
         print(self._read_reply())
         if VERIFY_HASH:
-            self._verify_hash(remote_name, data)
+            stored_data = decode_ascii_transfer(wire_data) if self.type_mode == "A" else data
+            self._verify_hash(remote_name, stored_data)
 
     def get(self, remote_name, local_path=None):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -272,13 +275,19 @@ class FTPClient:
         print(reply)
         if not reply.startswith("150"):
             return
-        data = self._recv_data_payload()
-        if data is None:
+        wire_data = self._recv_data_payload()
+        if wire_data is None:
             # The server still sends a final control-channel reply
             # regardless of whether our UDP receive succeeded (unconditionally
             # in best-effort mode; 426 once its own retry budget is exhausted
             # in GBN mode) — read and discard it now, or it gets misread as
             # the reply to whatever command runs next, desyncing the session.
+            print(self._read_reply())
+            return
+        try:
+            data = decode_ascii_transfer(wire_data) if self.type_mode == "A" else wire_data
+        except (UnicodeDecodeError, ValueError) as exc:
+            print(f"[!] Invalid TYPE A data received: {exc}")
             print(self._read_reply())
             return
         with open(local_path, "wb") as f:

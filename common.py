@@ -1,6 +1,7 @@
 """Shared constants and helpers for the Hybrid FTP control (TCP) and data (UDP) channels."""
 
 import hashlib
+import os
 import re
 import socket
 import struct
@@ -220,18 +221,59 @@ def gbn_receive(sock, expected_addr, rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, o
                 return None
 
 
-def ascii_mask(data):
-    """RFC 959 TYPE A (NVT-ASCII) is nominally 7-bit ASCII: the sender clears
-    the high bit of every byte before it goes on the wire. A genuine text
-    file (every byte already <= 0x7F) survives this unchanged. A binary file
-    (image, archive, ...) routinely has bytes >= 0x80 — roughly half of them,
-    for arbitrary binary data — and those get permanently altered. This is
-    irreversible by construction: there is no decode step, only encode. It's
-    the textbook reason FTP folklore insists on TYPE I for binary transfers;
-    called by the sending side only (handle_retr()/put()), never the
-    receiving side, since the corrupted bytes it produces ARE what the
-    receiver is meant to get, corruption and all."""
-    return bytes(b & 0x7F for b in data)
+def encode_ascii_transfer(data):
+    """Convert local 7-bit ASCII bytes to FTP's NVT-ASCII wire form.
+
+    LF and CRLF line endings become CRLF. A standalone carriage return is
+    represented as CR NUL. Non-ASCII input is rejected instead of silently
+    altered.
+    """
+    data.decode("ascii")  # strict validation; the byte values are used below
+    encoded = bytearray()
+    i = 0
+    while i < len(data):
+        byte = data[i]
+        if byte == 0x0D:
+            if i + 1 < len(data) and data[i + 1] == 0x0A:
+                encoded.extend(b"\r\n")
+                i += 2
+                continue
+            encoded.extend(b"\r\x00")
+        elif byte == 0x0A:
+            encoded.extend(b"\r\n")
+        else:
+            encoded.append(byte)
+        i += 1
+    return bytes(encoded)
+
+
+def decode_ascii_transfer(data, local_newline=None):
+    """Convert NVT-ASCII wire bytes to the receiver's local text form."""
+    data.decode("ascii")
+    if local_newline is None:
+        local_newline = os.linesep.encode("ascii")
+    elif isinstance(local_newline, str):
+        local_newline = local_newline.encode("ascii")
+
+    decoded = bytearray()
+    i = 0
+    while i < len(data):
+        byte = data[i]
+        if byte != 0x0D:
+            decoded.append(byte)
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            raise ValueError("malformed NVT-ASCII: trailing CR")
+        following = data[i + 1]
+        if following == 0x0A:
+            decoded.extend(local_newline)
+        elif following == 0x00:
+            decoded.append(0x0D)
+        else:
+            raise ValueError("malformed NVT-ASCII: CR must be followed by LF or NUL")
+        i += 2
+    return bytes(decoded)
 
 
 def compute_hash(data, algorithm="sha256"):
@@ -304,6 +346,7 @@ class Reply:
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
+    ASCII_CONVERSION_FAILED = "451 Requested action aborted: file is not valid ASCII text."
     CANT_OPEN_DATA_CONN = "425 Can't open data connection."
     FILE_UNAVAILABLE = "550 File unavailable."
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."
