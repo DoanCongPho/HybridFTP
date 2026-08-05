@@ -112,10 +112,20 @@ class FTPClient:
         raise NotImplementedError(f"data mode {self.data_mode!r} not implemented")
 
     def set_fixed(self):
-        """Switch back to Basic Level's fixed data-channel mechanism."""
+        """Switch back to Basic Level's fixed data-channel mechanism. Sends
+        FIXED so the server also reverts its session state — without this
+        round trip the server would keep using whatever per-session
+        ACTIVE/PASSIVE socket PORT/PASV last set up, while we listen on the
+        shared FIXED port instead, and every transfer after switching back
+        would silently fail (wrong source port on both ends)."""
+        reply = self.command("FIXED")
+        print(reply)
+        if not reply.startswith("200"):
+            return False
         self.data_mode = DataMode.FIXED
         self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), (self.host, self.data_port))
         print(f"[*] Data mode: FIXED ({self.host}:{self.data_port})")
+        return True
 
     def set_active(self):
         """Advanced Level: tell the server our address via PORT; it opens a

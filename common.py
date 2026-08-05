@@ -300,7 +300,7 @@ class Reply:
     NOT_LOGGED_IN = "530 Not logged in."
     COMMAND_OK = "200 Command OK."
     HELP_TEXT = ("214 Commands: USER PASS QUIT NOOP PWD CWD CDUP MKD RMD LIST NLST STAT "
-                 "SIZE MDTM TYPE MODE PORT PASV STOR RETR HASH HELP")
+                 "SIZE MDTM TYPE MODE PORT PASV FIXED STOR RETR HASH HELP")
     FILE_STATUS_OK = "150 File status okay, opening data connection."
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."

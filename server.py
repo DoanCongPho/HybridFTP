@@ -155,6 +155,7 @@ class Session:
         # socket so concurrent sessions don't collide — see
         # resolve_data_endpoint() and handle_port()/handle_pasv() below.
         self.data_mode = DataMode.FIXED
+        self.fixed_udp_sock = fixed_udp_sock  # kept so handle_fixed() can revert to it later
         self.data_sock = fixed_udp_sock
         self.owns_data_sock = False
         self.client_data_addr = None      # learned from the client's HELLO datagram, or from PORT
@@ -483,6 +484,25 @@ def handle_port(session, arg):
     send_line(session.conn, Reply.port_ok(sock.getsockname()[1]))
 
 
+def handle_fixed(session):
+    """FIXED: revert this session back to the shared, server-wide UDP data
+    channel — the counterpart to PORT/PASV for undoing an earlier
+    ACTIVE/PASSIVE switch. Needed because the client's `fixed` REPL command
+    has no other way to tell the server it changed data_mode: without this
+    control-channel round trip, the server keeps sending/receiving on the
+    old per-session ACTIVE/PASSIVE socket while the client listens on the
+    shared FIXED port instead, and every subsequent transfer silently drops
+    (packets arrive from/expected on the wrong port, filtered out as
+    foreign traffic) — see resolve_data_endpoint()'s lazy HELLO wait, which
+    only fires again here because client_data_addr is reset to None."""
+    session.close_data_socket()
+    session.data_sock = session.fixed_udp_sock
+    session.owns_data_sock = False
+    session.data_mode = DataMode.FIXED
+    session.client_data_addr = None
+    send_line(session.conn, Reply.COMMAND_OK)
+
+
 def cleanup_session(session):
     """Always run when a session ends — clean QUIT, abrupt disconnect, or an
     unhandled error — so sockets are closed and state doesn't linger.
@@ -648,6 +668,13 @@ def handle_client(conn, addr, fixed_udp_sock):
                         send_line(conn, Reply.NOT_LOGGED_IN)
                     else:
                         handle_pasv(session)
+                        _print_session_table()
+
+                elif cmd == "FIXED":
+                    if not session.authenticated:
+                        send_line(conn, Reply.NOT_LOGGED_IN)
+                    else:
+                        handle_fixed(session)
                         _print_session_table()
 
                 elif cmd == "STOR":
