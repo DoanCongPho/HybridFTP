@@ -530,16 +530,21 @@ def handle_client(conn, addr, fixed_udp_sock):
                         send_line(conn, Reply.LOGIN_SUCCESS)
                         # Fixed data-channel handshake: wait for the client's
                         # HELLO datagram so we learn its UDP address. Only
-                        # relevant if the session stays in FIXED mode; a
-                        # later PORT/PASV will overwrite client_data_addr.
-                        session.data_sock.settimeout(SOCK_TIMEOUT)
-                        try:
-                            raw, caddr = session.data_sock.recvfrom(1024)
-                            pkt_type, _, _, valid = parse_packet(raw)
-                            if valid and pkt_type == PKT_HELLO:
-                                session.client_data_addr = caddr
-                        except socket.timeout:
-                            pass
+                        # attempted if the client is actually staying on
+                        # FIXED mode (the default) — a client configured for
+                        # ACTIVE/PASSIVE never sends this HELLO and will
+                        # instead PORT/PASV right after PASS, so blocking
+                        # here for SOCK_TIMEOUT would just stall reading that
+                        # next command for no reason.
+                        if session.data_mode == DataMode.FIXED:
+                            session.data_sock.settimeout(SOCK_TIMEOUT)
+                            try:
+                                raw, caddr = session.data_sock.recvfrom(1024)
+                                pkt_type, _, _, valid = parse_packet(raw)
+                                if valid and pkt_type == PKT_HELLO:
+                                    session.client_data_addr = caddr
+                            except socket.timeout:
+                                pass
                         _print_session_table()
                     else:
                         send_line(conn, Reply.NOT_LOGGED_IN)
