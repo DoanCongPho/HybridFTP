@@ -161,7 +161,25 @@ class Session:
 
     def resolve_data_endpoint(self):
         """Single seam for finding out where/how to send or receive file
-        data for this session: (socket_to_use, client_address)."""
+        data for this session: (socket_to_use, client_address).
+
+        For FIXED mode, this lazily waits (once, on first use) for the
+        client's initial HELLO datagram to learn client_address — deferred
+        here rather than done eagerly right after PASS, because at PASS time
+        the server can't yet tell whether the client is going to stay on
+        FIXED or is about to send PORT/PASV instead (that decision is made
+        client-side, after PASS's 230 reply). Blocking in PASS regardless
+        of the client's choice would stall reading its next command for up
+        to SOCK_TIMEOUT for no reason whenever it's not actually FIXED."""
+        if self.data_mode == DataMode.FIXED and self.client_data_addr is None:
+            self.data_sock.settimeout(SOCK_TIMEOUT)
+            try:
+                raw, caddr = self.data_sock.recvfrom(1024)
+                pkt_type, _, _, valid = parse_packet(raw)
+                if valid and pkt_type == PKT_HELLO:
+                    self.client_data_addr = caddr
+            except socket.timeout:
+                pass
         return self.data_sock, self.client_data_addr
 
     def close_data_socket(self):
@@ -528,23 +546,14 @@ def handle_client(conn, addr, fixed_udp_sock):
                     if session.username and USERS.get(session.username) == arg:
                         session.authenticated = True
                         send_line(conn, Reply.LOGIN_SUCCESS)
-                        # Fixed data-channel handshake: wait for the client's
-                        # HELLO datagram so we learn its UDP address. Only
-                        # attempted if the client is actually staying on
-                        # FIXED mode (the default) — a client configured for
-                        # ACTIVE/PASSIVE never sends this HELLO and will
-                        # instead PORT/PASV right after PASS, so blocking
-                        # here for SOCK_TIMEOUT would just stall reading that
-                        # next command for no reason.
-                        if session.data_mode == DataMode.FIXED:
-                            session.data_sock.settimeout(SOCK_TIMEOUT)
-                            try:
-                                raw, caddr = session.data_sock.recvfrom(1024)
-                                pkt_type, _, _, valid = parse_packet(raw)
-                                if valid and pkt_type == PKT_HELLO:
-                                    session.client_data_addr = caddr
-                            except socket.timeout:
-                                pass
+                        # FIXED-mode data-channel handshake (learning the
+                        # client's HELLO datagram) happens lazily on first
+                        # actual data command, not here — see
+                        # resolve_data_endpoint(). PASS can't yet tell
+                        # whether the client is staying on FIXED or about to
+                        # send PORT/PASV, so blocking here for SOCK_TIMEOUT
+                        # regardless of that choice would stall reading the
+                        # client's next command for no reason.
                         _print_session_table()
                     else:
                         send_line(conn, Reply.NOT_LOGGED_IN)
