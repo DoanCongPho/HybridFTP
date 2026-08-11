@@ -10,8 +10,7 @@ docs/*.out
 docs/*.toc
 output.log
 
-certs&keys/
+certs&keys/*
 !certs&keys/cert.pem
-*.key
 
-server_storage
+server_storage/
