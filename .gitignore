@@ -11,5 +11,7 @@ docs/*.toc
 output.log
 
 certs&keys/
+!certs&keys/cert.pem
 *.key
-*.crt
+
+server_storage
