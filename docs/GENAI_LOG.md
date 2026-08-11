@@ -534,3 +534,89 @@ corruption. Confirmed pdflatex/mermaid-cli were available locally, then produced
   by a second method.
 
 ---
+
+## Entry 15 — Three robustness fixes: server-side upload integrity, listen() backlog, PASSIVE keepalive
+
+**Prompt used:**
+> I want to change it to server check (if the integrity check == fail drop file that user upload) drop
+> the previous fix. `tcp_sock.listen(5 if THREADING_MODE == "thread" else 1)` this line say that only
+> access 5 users is there any better option ?. and In the passive mode, the data channel ussually drop at
+> NAT client. I want to have the mechanism to send small packet to keep this connection only drop if user
+> exceed the idle time.
+
+(This followed the AI's own prior write-up — reproduced in Entry 14's context, not repeated here — which
+had flagged the client-side hash-verification flow's cross-platform `os.linesep` edge case as a documented
+limitation rather than a fix. The student rejected leaving it as a documented limitation and asked for an
+actual server-side mechanism instead.)
+
+**Raw GenAI output (summary of actions taken):**
+Before writing code, the AI asked two clarifying questions via a structured choice prompt, since the
+request as stated left two protocol-shape decisions genuinely open: (1) how should the server obtain the
+"correct" hash to check an upload against — piggybacked directly on the `STOR` command's own argument
+list (recommended, one round trip, no new command) vs. a separate follow-up command after the existing
+`226`; and (2) should the requested NAT-keepalive mechanism cover PASSIVE mode only (matching what the
+student actually hit) or both PASSIVE and ACTIVE. The student answered: hashing should trigger
+automatically whenever `[integrity] verify=true`, with the server dropping the file and telling the user
+on failure (confirming the piggyback-on-`STOR` design); and keepalive scoped to PASSIVE only, client-driven.
+
+Implemented across four files:
+- `common.py`: added `Reply.INTEGRITY_FAILED = "552 Integrity check failed; uploaded file discarded."`
+- `server.py`: `tcp_sock.listen(5 if THREADING_MODE == "thread" else 1)` → `tcp_sock.listen(128)`, with a
+  comment explaining `listen()`'s backlog only bounds not-yet-`accept()`ed connections, not concurrent
+  clients — raising it is safe regardless of threading mode. `handle_stor()` now parses an optional
+  trailing `<algorithm> <hash>` off the `STOR` argument list; after writing the file, if a hash was
+  supplied it recomputes the hash of what was actually written, and on mismatch `os.remove()`s the file
+  and replies `552` instead of `226` (unrecognized algorithm names are treated as a mismatch rather than
+  raising).
+- `client.py`: `put()` now computes the hash of what the server will actually persist (post
+  `decode_ascii_transfer()` round-trip for TYPE A) *before* sending `STOR`, and appends it to the command
+  only when `VERIFY_HASH` is set — so `config.ini` deleted/`verify=false` reproduces the exact old wire
+  format. The old post-upload client-side `HASH` round-trip in `put()` was removed as redundant (the
+  server's own `226`/`552` reply is now the verdict); `get()`'s client-side verify is untouched, since the
+  client is still the one persisting the downloaded bytes. Separately, added a background daemon thread
+  (`_keepalive_loop`/`_start_keepalive`/`_stop_keepalive`) that, only while `data_mode == PASSIVE` and no
+  transfer is in flight (`_data_busy` flag, set around the actual UDP send/receive phases of
+  `put()`/`_recv_data_payload()`), resends the same `PKT_HELLO` datagram to the passive target every
+  `[client] keepalive_interval` seconds (new config key, default 15, PASSIVE-only, no server-side
+  counterpart needed). Started on `set_passive()`, stopped on `set_active()`/`set_fixed()`/`close()`.
+- `config.ini`: documented and added `keepalive_interval = 15` under `[client]`.
+
+**Refinement & problem solving:**
+- **Asked before designing, rather than guessing the protocol shape.** The request text alone didn't
+  specify how the server would learn the expected hash — the AI surfaced this as an explicit either/or
+  choice instead of silently picking one, since getting it wrong would have meant reworking both ends of
+  the wire format later.
+- **Verified server-side deletion with an adversarial test, not just the happy path.** Set up a disposable
+  loopback `config.ini` (`mode=gbn`, `verify=true`, `keepalive_interval=2`), started a real server, then
+  drove `FTPClient` directly from a throwaway script that monkey-patched `compute_hash()` to return a
+  deliberately wrong digest for one `put()` call. Confirmed: the server's log recorded the mismatch with
+  both the expected and actual hashes, the file was absent from `server_storage/` afterward, and the client
+  printed the new `552` reply — not just that no exception was raised.
+- **Verified the normal path separately**: a real `put`+`get` round trip with a correct hash returned `226`
+  both times and printed `Integrity verified ... MATCH` for the download side.
+- **Verified the keepalive doesn't corrupt a real transfer that follows it** — idled a live PASSIVE session
+  for 6 seconds (three keepalive ticks at the 2-second test interval) and then immediately ran a real
+  `put()`; it succeeded on the first attempt with no GBN retransmits logged, confirming the existing
+  `drain_stale_packets()` call (already present before every `STOR`/`RETR`/`LIST`, added for an unrelated
+  reason in an earlier session) silently absorbs the queued keepalive datagrams rather than being misread
+  as transfer data.
+- **Rejected adding a new packet type or any server-side keepalive logic.** The server never needs to
+  distinguish a keepalive `PKT_HELLO` from any other stray datagram — it already either hasn't started
+  listening on that socket yet (queues harmlessly in the OS receive buffer) or is between transfers
+  (drained). Reusing the existing packet type and existing drain call kept this additive with zero changes
+  to `server.py`'s data-channel code path.
+- **Test hygiene**: backed up the student's real `config.ini` (which carries a live Azure `advertise_ip`
+  and passive port range unsuitable for loopback testing) before swapping in a throwaway loopback config,
+  restored it afterward, and inspected `git diff config.ini` to confirm only the intended
+  `keepalive_interval` addition survived — same discipline as Entry 12.
+- `[student to fill in]`: re-derive, without notes, why the integrity hash rides on `STOR`'s own argument
+  line instead of a separate command, and why that's *not* the kind of protocol-negotiation the project
+  deliberately avoids for `[reliability] mode` (see `CLAUDE.md`) — the distinction is that this is
+  optional/tolerant (a `STOR` with no hash behaves exactly as before), not a mandatory handshake both ends
+  must agree on ahead of time.
+- `[student to fill in]`: explain why the NAT keepalive only needed to be implemented client-side for
+  PASSIVE mode, tied to which end's HELLO datagram actually creates the NAT/router UDP mapping in the
+  first place — this is a natural oral-defense follow-up to the existing PASV/PORT theory questions in
+  Entry 11.
+
+---

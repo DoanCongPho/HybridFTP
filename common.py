@@ -347,6 +347,7 @@ class Reply:
     TRANSFER_COMPLETE = "226 Transfer complete."
     TRANSFER_ABORTED = "426 Connection closed; transfer aborted."
     ASCII_CONVERSION_FAILED = "451 Requested action aborted: file is not valid ASCII text."
+    INTEGRITY_FAILED = "552 Integrity check failed; uploaded file discarded."
     CANT_OPEN_DATA_CONN = "425 Can't open data connection."
     FILE_UNAVAILABLE = "550 File unavailable."
     SYNTAX_ERROR_CMD = "500 Syntax error, command unrecognized."

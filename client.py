@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import socket
+import threading
 import time
 
 from common import (
@@ -64,6 +65,16 @@ HASH_ALGORITHM = CONFIG.get("integrity", "algorithm", fallback="sha256").strip()
 if HASH_ALGORITHM not in ("sha256", "md5"):
     HASH_ALGORITHM = "sha256"
 
+# PASSIVE mode only: NAT/router UDP mappings are typically torn down after
+# some seconds of no traffic on that (local-port, remote-addr) pair — far
+# shorter than CONTROL_IDLE_TIMEOUT (300s). Below this, we're the side that
+# created the mapping (our HELLO to the server's passive port), so we're
+# also the side responsible for refreshing it while the session is
+# otherwise idle. 0 (or absent) disables this entirely. Purely additive:
+# the server never needs to know about these packets (see
+# FTPClient._keepalive_loop()), so no config key is needed server-side.
+KEEPALIVE_INTERVAL = CONFIG.getint("client", "keepalive_interval", fallback=15)
+
 
 class FTPClient:
     def __init__(self, host, control_port=CONTROL_PORT, data_port=DATA_PORT):
@@ -91,6 +102,13 @@ class FTPClient:
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.bind(("", 0))  # ephemeral port; server discovers it via our HELLO packet
 
+        # PASSIVE-mode NAT keepalive — see KEEPALIVE_INTERVAL and
+        # _keepalive_loop(). _data_busy pauses keepalives during a real
+        # transfer so they don't interleave with GBN's own ACK bookkeeping.
+        self._keepalive_thread = None
+        self._keepalive_stop = threading.Event()
+        self._data_busy = False
+
         print(self._read_reply())
 
     def _read_reply(self):
@@ -112,6 +130,36 @@ class FTPClient:
             return self.passive_target
         raise NotImplementedError(f"data mode {self.data_mode!r} not implemented")
 
+    def _keepalive_loop(self):
+        """Background thread body: while in PASSIVE mode and not mid-transfer,
+        periodically re-send the same HELLO packet used to establish the
+        mapping in the first place, purely to keep our own NAT/router's UDP
+        translation from expiring during a long idle stretch between
+        commands. The server doesn't need to treat these specially — it
+        either hasn't started listening on this socket yet (queues up in the
+        OS buffer, harmless) or is between transfers (drain_stale_packets()
+        clears it before the next STOR/RETR/LIST)."""
+        while not self._keepalive_stop.wait(KEEPALIVE_INTERVAL):
+            if self.data_mode != DataMode.PASSIVE or self.passive_target is None or self._data_busy:
+                continue
+            try:
+                self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"KEEPALIVE"), self.passive_target)
+            except OSError:
+                pass
+
+    def _start_keepalive(self):
+        if KEEPALIVE_INTERVAL <= 0 or (self._keepalive_thread and self._keepalive_thread.is_alive()):
+            return
+        self._keepalive_stop.clear()
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self._keepalive_thread.start()
+
+    def _stop_keepalive(self):
+        self._keepalive_stop.set()
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=1)
+        self._keepalive_thread = None
+
     def set_fixed(self):
         """Switch back to Basic Level's fixed data-channel mechanism. Sends
         FIXED so the server also reverts its session state — without this
@@ -119,6 +167,7 @@ class FTPClient:
         ACTIVE/PASSIVE socket PORT/PASV last set up, while we listen on the
         shared FIXED port instead, and every transfer after switching back
         would silently fail (wrong source port on both ends)."""
+        self._stop_keepalive()
         reply = self.command("FIXED")
         print(reply)
         if not reply.startswith("200"):
@@ -132,6 +181,7 @@ class FTPClient:
         """Advanced Level: tell the server our address via PORT; it opens a
         dedicated per-session socket and reports its port back (needed for
         the upload direction, since UDP has no server-initiated connect())."""
+        self._stop_keepalive()
         local_ip = self.conn.getsockname()[0]
         local_port = self.udp_sock.getsockname()[1]
         reply = self.command(f"PORT {format_port_arg(local_ip, local_port)}")
@@ -163,6 +213,7 @@ class FTPClient:
         self.data_mode = DataMode.PASSIVE
         self.udp_sock.sendto(make_packet(PKT_HELLO, 0, b"HELLO"), self.passive_target)
         print(f"[*] Data mode: PASSIVE (server at {self.passive_target[0]}:{self.passive_target[1]})")
+        self._start_keepalive()
         return True
 
     def login(self, username, password):
@@ -196,35 +247,43 @@ class FTPClient:
         Callers must drain_stale_packets() themselves *before* sending the
         RETR/LIST/NLST request (not here) — the server may start sending the
         instant it sees our request, so draining at this point risks
-        discarding this transfer's own first packets on a fast/local network."""
-        if RELIABILITY_MODE == "gbn":
-            target = self._data_target()
+        discarding this transfer's own first packets on a fast/local network.
 
-            def _log_reack(expected_seq, got_seq):
-                print(f"[GBN] out-of-order/duplicate/corrupt from {target} "
-                      f"(expected seq={expected_seq}, got={got_seq}) — re-ACKing {expected_seq - 1}")
-            data = gbn_receive(self.udp_sock, target, rto=GBN_RTO,
-                                max_retries=GBN_MAX_RETRIES, on_reack=_log_reack)
-            if data is None:
-                print("[!] Data transfer timed out.")
-            return data
-        chunks = {}
-        self.udp_sock.settimeout(SOCK_TIMEOUT)
+        Sets _data_busy for the duration so the PASSIVE-mode keepalive
+        thread (see _keepalive_loop()) doesn't interleave a stray HELLO
+        into this transfer's packet stream."""
+        self._data_busy = True
         try:
-            while True:
-                raw, _addr = self.udp_sock.recvfrom(CHUNK_SIZE + 64)
-                pkt_type, seq, payload, valid = parse_packet(raw)
-                if not valid:
-                    print(f"[!] Corrupt packet seq={seq} dropped.")
-                    continue
-                if pkt_type == PKT_FIN:
-                    break
-                if pkt_type == PKT_DATA:
-                    chunks[seq] = payload
-        except socket.timeout:
-            print("[!] Data transfer timed out.")
-            return None
-        return b"".join(chunks[s] for s in sorted(chunks))
+            if RELIABILITY_MODE == "gbn":
+                target = self._data_target()
+
+                def _log_reack(expected_seq, got_seq):
+                    print(f"[GBN] out-of-order/duplicate/corrupt from {target} "
+                          f"(expected seq={expected_seq}, got={got_seq}) — re-ACKing {expected_seq - 1}")
+                data = gbn_receive(self.udp_sock, target, rto=GBN_RTO,
+                                    max_retries=GBN_MAX_RETRIES, on_reack=_log_reack)
+                if data is None:
+                    print("[!] Data transfer timed out.")
+                return data
+            chunks = {}
+            self.udp_sock.settimeout(SOCK_TIMEOUT)
+            try:
+                while True:
+                    raw, _addr = self.udp_sock.recvfrom(CHUNK_SIZE + 64)
+                    pkt_type, seq, payload, valid = parse_packet(raw)
+                    if not valid:
+                        print(f"[!] Corrupt packet seq={seq} dropped.")
+                        continue
+                    if pkt_type == PKT_FIN:
+                        break
+                    if pkt_type == PKT_DATA:
+                        chunks[seq] = payload
+            except socket.timeout:
+                print("[!] Data transfer timed out.")
+                return None
+            return b"".join(chunks[s] for s in sorted(chunks))
+        finally:
+            self._data_busy = False
 
     def put(self, local_path, remote_name=None):
         if not os.path.isfile(local_path):
@@ -239,30 +298,44 @@ class FTPClient:
             print("[!] TYPE A requires a 7-bit ASCII text file; use 'type I' for binary data.")
             return
 
-        reply = self.command(f"STOR {remote_name}")
+        stor_cmd = f"STOR {remote_name}"
+        if VERIFY_HASH:
+            # Hash what the server will actually end up writing to disk (the
+            # post-ASCII-round-trip bytes for TYPE A) so it matches what
+            # handle_stor() hashes server-side after decode_ascii_transfer().
+            stored_preview = decode_ascii_transfer(wire_data) if self.type_mode == "A" else data
+            stor_cmd += f" {HASH_ALGORITHM} {compute_hash(stored_preview, HASH_ALGORITHM)}"
+
+        reply = self.command(stor_cmd)
         print(reply)
         if not reply.startswith("150"):
             return
         target = self._data_target()
-        if RELIABILITY_MODE == "gbn":
-            def _log_retransmit(base, next_seq, retries):
-                print(f"[GBN] retransmit window seq={base}..{next_seq - 1} "
-                      f"(retry #{retries}) to {target} — real packet loss detected")
-            if not gbn_send(self.udp_sock, target, wire_data, window_size=GBN_WINDOW_SIZE,
-                             rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=_log_retransmit):
-                print("[!] Upload failed: server did not acknowledge (timed out).")
-                return
-        else:
-            seq = 0
-            for i in range(0, len(wire_data), CHUNK_SIZE):
-                chunk = wire_data[i:i + CHUNK_SIZE]
-                self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
-                seq += 1
-            self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
+        self._data_busy = True
+        try:
+            if RELIABILITY_MODE == "gbn":
+                def _log_retransmit(base, next_seq, retries):
+                    print(f"[GBN] retransmit window seq={base}..{next_seq - 1} "
+                          f"(retry #{retries}) to {target} — real packet loss detected")
+                if not gbn_send(self.udp_sock, target, wire_data, window_size=GBN_WINDOW_SIZE,
+                                 rto=GBN_RTO, max_retries=GBN_MAX_RETRIES, on_retransmit=_log_retransmit):
+                    print("[!] Upload failed: server did not acknowledge (timed out).")
+                    return
+            else:
+                seq = 0
+                for i in range(0, len(wire_data), CHUNK_SIZE):
+                    chunk = wire_data[i:i + CHUNK_SIZE]
+                    self.udp_sock.sendto(make_packet(PKT_DATA, seq, chunk), target)
+                    seq += 1
+                self.udp_sock.sendto(make_packet(PKT_FIN, seq), target)
+        finally:
+            self._data_busy = False
+        # The server already ran the integrity check itself when VERIFY_HASH
+        # sent a hash above (deleting the file and replying 552 on mismatch)
+        # — its own reply below (226 or 552) is the verdict, no separate
+        # client-side round trip needed for uploads. get() still verifies
+        # client-side since the client is the one persisting the download.
         print(self._read_reply())
-        if VERIFY_HASH:
-            stored_data = decode_ascii_transfer(wire_data) if self.type_mode == "A" else data
-            self._verify_hash(remote_name, stored_data)
 
     def get(self, remote_name, local_path=None):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -336,6 +409,7 @@ class FTPClient:
         print(self._read_reply())
 
     def close(self):
+        self._stop_keepalive()
         try:
             self.conn.close()
         except OSError:

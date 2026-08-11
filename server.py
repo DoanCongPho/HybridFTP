@@ -216,10 +216,18 @@ def _send_over_data_channel(session, data):
     return True
 
 
-def handle_stor(session, filename):
-    if not filename:
+def handle_stor(session, arg):
+    if not arg:
         send_line(session.conn, Reply.SYNTAX_ERROR_PARAMS)
         return
+    # Optional trailing "<algorithm> <hash>", appended by the client only
+    # when its own [integrity] verify=true — see common.compute_hash(). Not
+    # a negotiated protocol feature: the client decides whether to include
+    # it, the server just checks it when present, so config.ini deleted (or
+    # verify=false) reproduces the exact old behavior with no hash at all.
+    parts = arg.split()
+    filename = parts[0]
+    expected_algorithm, expected_hash = (parts[1].lower(), parts[2].lower()) if len(parts) == 3 else (None, None)
     fs_path = safe_path(session, filename)
     if fs_path is None:
         send_line(session.conn, Reply.FILE_UNAVAILABLE)
@@ -276,6 +284,19 @@ def handle_stor(session, filename):
 
     with open(fs_path, "wb") as f:
         f.write(stored_data)
+
+    if expected_hash is not None:
+        try:
+            actual_hash = compute_hash(stored_data, expected_algorithm)
+        except ValueError:
+            actual_hash = ""  # unrecognized algorithm name from the client — treat as a mismatch
+        if actual_hash.lower() != expected_hash:
+            os.remove(fs_path)
+            print(f"[!] Integrity check failed for '{filename}' from user '{session.username}' "
+                  f"(expected {expected_algorithm}:{expected_hash}, got {actual_hash}) — upload discarded.")
+            send_line(session.conn, Reply.INTEGRITY_FAILED)
+            return
+
     print(f"[+] Stored '{filename}' ({len(stored_data)} bytes) from user '{session.username}'")
     send_line(session.conn, Reply.TRANSFER_COMPLETE)
 
@@ -728,7 +749,14 @@ def main():
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcp_sock.bind((host, CONTROL_PORT))
-    tcp_sock.listen(5 if THREADING_MODE == "thread" else 1)
+    # `listen()`'s backlog only bounds how many not-yet-accept()ed connections
+    # the kernel will queue — it is not a cap on concurrent clients (that's
+    # governed by THREADING_MODE/os resources instead). A low backlog just
+    # means a burst of near-simultaneous connects gets some of them refused
+    # outright instead of queued, which is worse in single-threaded mode
+    # (accept() isn't called again until the current client's whole session
+    # ends) but harmless to raise either way, so use one generous constant.
+    tcp_sock.listen(128)
     print(f"[*] Hybrid FTP server listening on TCP {CONTROL_PORT}, UDP data port {DATA_PORT}")
     print(f"[*] Storage root: {STORAGE_ROOT}")
     print(f"[*] Concurrency mode: {THREADING_MODE}")
