@@ -21,6 +21,10 @@ import posixpath
 import socket
 import threading
 import time
+import ssl
+
+
+
 
 print = functools.partial(print, flush=True)  # keep server log visible even when output is redirected
 
@@ -41,6 +45,31 @@ else:
 
 THREADING_MODE = CONFIG.get("server", "threading", fallback="single")   # single | thread
 ADVERTISE_IP = CONFIG.get("server", "advertise_ip", fallback="").strip()
+
+
+def _resolve_repo_path(cfg_value):
+    """Same convention as STORAGE_ROOT above: a relative config path is
+    resolved against this script's own directory (so the server behaves
+    the same regardless of the shell's current working directory when it
+    was launched), an absolute path is used as-is."""
+    if os.path.isabs(cfg_value):
+        return cfg_value
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), cfg_value)
+
+
+TLS_ENABLE = CONFIG.getboolean("tls", "enable", fallback=False)
+CERT_PATH = _resolve_repo_path(CONFIG.get("tls", "certfile", fallback=""))
+KEY_PATH = _resolve_repo_path(CONFIG.get("tls", "keyfile", fallback=""))
+
+
+def _build_tls_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+    return ctx
+
+
+_context = _build_tls_context() if TLS_ENABLE else None
+
 
 # Port range for per-session ACTIVE/PASSIVE UDP sockets. Blank (the default)
 # means "let the OS pick any free ephemeral port" — fine on a LAN/loopback,
@@ -760,14 +789,25 @@ def main():
     print(f"[*] Hybrid FTP server listening on TCP {CONTROL_PORT}, UDP data port {DATA_PORT}")
     print(f"[*] Storage root: {STORAGE_ROOT}")
     print(f"[*] Concurrency mode: {THREADING_MODE}")
+    print(f"[*] TLS: {'on' if TLS_ENABLE else 'off'}")
 
     def serve(conn, addr):
+        if TLS_ENABLE:
+            try:
+                conn = _context.wrap_socket(conn, server_side=True)
+            except ssl.SSLError as e:
+                print(f"[!] TLS handshake failed with {addr}: {e!r}")
+                conn.close()
+                return
+            except OSError as e:
+                print(f"[!] Connection error during handshake with {addr}: {e!r}")
+                conn.close()
+                return
         try:
             handle_client(conn, addr, udp_sock)
         except Exception as e:
-            # A single bad session (malformed input, unexpected client
-            # behavior, etc.) must not take the whole server down.
             print(f"[!] Session with {addr} crashed: {e!r}")
+
 
     try:
         while True:

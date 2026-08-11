@@ -34,6 +34,7 @@ import sys
 import socket
 import threading
 import time
+import ssl
 
 from common import (
     CONTROL_PORT, DATA_PORT, CHUNK_SIZE, SOCK_TIMEOUT, DataMode,
@@ -75,6 +76,19 @@ if HASH_ALGORITHM not in ("sha256", "md5"):
 # FTPClient._keepalive_loop()), so no config key is needed server-side.
 KEEPALIVE_INTERVAL = CONFIG.getint("client", "keepalive_interval", fallback=15)
 
+TLS_ENABLE = CONFIG.getboolean("tls", "enable", fallback=False)
+TLS_CAFILE = CONFIG.get(
+    "tls", "certfile",
+    fallback=os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs&keys", "cert.pem")
+)
+
+def _build_tls_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(TLS_CAFILE)
+    return ctx
+
+tls_context = _build_tls_context() if TLS_ENABLE else None
+
 
 class FTPClient:
     def __init__(self, host, control_port=CONTROL_PORT, data_port=DATA_PORT):
@@ -96,8 +110,20 @@ class FTPClient:
         self.active_server_port = None   # learned from the server's PORT reply
         self.passive_target = None       # learned from the server's PASV reply
 
-        self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.conn.connect((host, control_port))
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.connect((self.host, control_port))
+
+        if TLS_ENABLE:
+            try:
+                self.conn = tls_context.wrap_socket(raw_sock, server_hostname=host)
+            except ssl.SSLCertVerificationError as e:
+                raw_sock.close()
+                raise SystemExit(f"[TLS] Cert verify failed — is cert.pem the right one? {e}")
+            except ssl.SSLError as e:
+                raw_sock.close()
+                raise SystemExit(f"[TLS] Handshake failed: {e}")
+        else:
+            self.conn = raw_sock
 
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.bind(("", 0))  # ephemeral port; server discovers it via our HELLO packet

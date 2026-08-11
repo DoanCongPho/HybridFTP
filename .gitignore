@@ -8,3 +8,8 @@ docs/*.aux
 docs/*.log
 docs/*.out
 docs/*.toc
+output.log
+
+certs&keys/
+*.key
+*.crt
