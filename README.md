@@ -69,3 +69,18 @@ python3 client.py <server_host>
 No `config.ini` needed for the baseline (plain USER/PASS, upload/download, one client at a
 time). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full command list and every
 opt-in config preset (concurrency, Active/Passive mode, Go-Back-N, integrity verification, TLS).
+
+## Benchmark the reliability layer
+
+`benchmarks/gbn_benchmark.py` drives the real `common.gbn_send()`/`gbn_receive()` functions
+through a loss-injected loopback socket pair — no mocking — sweeping `window_size`, `rto_ms`,
+and simulated packet loss, and compares against a best-effort (`mode=none`) baseline. Standalone
+tool, not part of the graded app; doesn't touch `server.py`/`client.py`/`common.py`.
+
+```
+python3 benchmarks/gbn_benchmark.py --sweep all --payload-kb 64 --trials 3 --seed 1 --out benchmarks/results.csv
+python3 benchmarks/plot_results.py benchmarks/results.csv   # optional, needs matplotlib
+```
+
+`--sweep {window,rto,baseline,all}` to run a subset; `--trials` controls repeats per parameter
+combination (loss is randomized, so more trials = less noisy results, especially near 50% loss).

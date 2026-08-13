@@ -40,4 +40,3 @@ medium-to-high effort and would need a deliberate design decision (documented th
 project already documents `Reply.port_ok()`'s RFC 959 deviation) before implementing, since it
 touches the packet header/framing that `gbn_send()`/`gbn_receive()`/`compute_hash()` all depend on.
 
----
